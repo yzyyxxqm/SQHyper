@@ -8,7 +8,6 @@ notes.md
 pytorch.bin
 *.code-workspace
 
-storage/
 log/
 logs/
 wandb/

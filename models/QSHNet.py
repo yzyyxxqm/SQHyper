@@ -235,11 +235,15 @@ class HypergraphEncoder(nn.Module):
 # ============================================================================
 
 class HypergraphLearner(nn.Module):
-    def __init__(self, n_layers, d_model, n_heads, time_length):
+    def __init__(self, n_layers, d_model, n_heads, time_length,
+                 use_quaternion_h2n=True, use_spiking=True, use_causal_mask=True):
         super().__init__()
         self.n_layers = n_layers
         self.d_model = d_model
         self.activation = nn.ReLU()
+        self.use_quaternion_h2n = use_quaternion_h2n
+        self.use_spiking = use_spiking
+        self.use_causal_mask = use_causal_mask
 
         # Identical to HyperIMTS: node→hyperedge attention
         self.node2temporal_hyperedge = nn.ModuleList([
@@ -252,19 +256,22 @@ class HypergraphLearner(nn.Module):
             MultiHeadAttentionBlock(d_model, 3*d_model, 3*d_model, d_model, n_heads)
             for _ in range(n_layers)])
 
-        # CHANGE 1: QuaternionLinear for hyperedge→node fusion (Kronecker block Hamilton product)
-        # This lets the quaternion's inter-component coupling directly participate in
-        # merging temporal, variable, and node information — not just as a preprocessing step.
-        self.hyperedge2node = nn.ModuleList([
-            QuaternionLinear(3*d_model, d_model) for _ in range(n_layers)])
+        # h2n: QuaternionLinear or plain Linear depending on ablation flag
+        if use_quaternion_h2n:
+            self.hyperedge2node = nn.ModuleList([
+                QuaternionLinear(3*d_model, d_model) for _ in range(n_layers)])
+        else:
+            self.hyperedge2node = nn.ModuleList([
+                nn.Linear(3*d_model, d_model) for _ in range(n_layers)])
 
         self.variable_hyperedge2variable_hyperedge = IrregularityAwareAttention(d_model)
         self.hyperedge2hyperedge_layers = [n_layers - 1]
         self.scale = 1 / time_length
         self.oom_flag = False
 
-        # CHANGE 2: Time-aware spiking gate (uses Δt for LIF-style decay)
-        self.spikes = nn.ModuleList([TimeAwareSpikingGate(d_model) for _ in range(n_layers)])
+        # Spiking gate (only created if enabled)
+        if use_spiking:
+            self.spikes = nn.ModuleList([TimeAwareSpikingGate(d_model) for _ in range(n_layers)])
 
     def get_fine_grained_embedding(self, tensor_flattened, target_shape):
         """Identical to HyperIMTS."""
@@ -285,22 +292,20 @@ class HypergraphLearner(nn.Module):
         D = self.d_model
         L = temporal_incidence_matrix.shape[1]
 
-        # CHANGE 3: Build causal temporal mask — for each temporal hyperedge at
-        # timestep t, only allow aggregation from nodes whose time_index <= t.
-        # This enforces strict causality: information flows past→future only.
-        # causal_t_mask: (B, L, N) where entry (b, t, n) = 1 iff time_indices[b,n] <= t
-        node_times = time_indices_flattened.unsqueeze(1).float()  # (B, 1, N)
-        he_times = torch.arange(L, device=node_times.device).view(1, L, 1).float()  # (1, L, 1)
-        causal_t_mask = (node_times <= he_times).float()  # (B, L, N)
-        # Combine with observation mask: only valid observed nodes participate
-        causal_t_inc = temporal_incidence_matrix * causal_t_mask
+        # Causal temporal mask (only if enabled)
+        if self.use_causal_mask:
+            node_times = time_indices_flattened.unsqueeze(1).float()
+            he_times = torch.arange(L, device=node_times.device).view(1, L, 1).float()
+            causal_t_mask = (node_times <= he_times).float()
+            causal_t_inc = temporal_incidence_matrix * causal_t_mask
+        else:
+            causal_t_inc = temporal_incidence_matrix
 
         for i in range(self.n_layers):
             if i == 0:
                 mask_temp = 1 - repeat(y_mask_L_flattened, "B N -> B L N", L=L)
                 mask_temp[mask_temp == 0] = 1e-8
 
-            # Node→temporal hyperedge with CAUSAL incidence mask
             inc_t = causal_t_inc if i != 0 else causal_t_inc * mask_temp
             temporal_hyperedges_updated = self.node2temporal_hyperedge[i](
                 temporal_hyperedges,
@@ -312,7 +317,6 @@ class HypergraphLearner(nn.Module):
                 mask_temp = 1 - repeat(y_mask_L_flattened, "B N -> B E N", E=variable_incidence_matrix.shape[1])
                 mask_temp[mask_temp == 0] = 1e-8
 
-            # Node→variable hyperedge (no causal constraint needed for variable dimension)
             variable_hyperedges_updated = self.node2variable_hyperedge[i](
                 variable_hyperedges,
                 torch.cat([temporal_hyperedges.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D)),
@@ -322,7 +326,6 @@ class HypergraphLearner(nn.Module):
             variable_hyperedges = variable_hyperedges_updated
             temporal_hyperedges = temporal_hyperedges_updated
 
-            # Hyperedge→node: QUATERNION fusion via Kronecker block Hamilton product
             tg = temporal_hyperedges.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D))
             vg = variable_hyperedges.gather(1, repeat(variable_indices_flattened, "B N -> B N D", D=D))
             md = repeat(x_y_mask_flattened, "B N -> B N D", D=D)
@@ -345,10 +348,10 @@ class HypergraphLearner(nn.Module):
                     (observation_nodes + self.hyperedge2node[i](
                         torch.cat([observation_nodes, tg, vg], -1))) * md)
 
-            # Time-aware spiking gate with Δt-driven membrane decay
-            observation_nodes = self.spikes[i](observation_nodes, md, dt_flattened)
+            # Spiking gate (only if enabled)
+            if self.use_spiking:
+                observation_nodes = self.spikes[i](observation_nodes, md, dt_flattened)
 
-            # Hyperedge-to-hyperedge (identical to HyperIMTS, last layer only)
             if i in self.hyperedge2hyperedge_layers:
                 sync_mask = x_y_mask
                 qk = self.get_fine_grained_embedding(observation_nodes, sync_mask)
@@ -366,6 +369,17 @@ class HypergraphLearner(nn.Module):
 # ============================================================================
 
 class Model(nn.Module):
+    """
+    QSH-Net with ablation support.
+    
+    Ablation flags (set via model_id string parsing for script compatibility):
+    - use_quaternion_block: QuaternionBlock after encoder (default: True)
+    - use_quaternion_h2n: QuaternionLinear in h2n fusion (default: True)
+    - use_spiking: TimeAwareSpikingGate per layer (default: True)
+    - use_causal_mask: Causal temporal incidence masking (default: True)
+    
+    model_id format: "QSHNet" or "QSHNet_noQB_noQH_noSP_noCM" etc.
+    """
     def __init__(self, configs: ExpConfigs):
         super().__init__()
         self.configs = configs
@@ -378,13 +392,25 @@ class Model(nn.Module):
         pl = configs.pred_len_max_irr or configs.pred_len
         tl = sl + pl
 
-        # HyperIMTS core (identical structure)
+        # Parse ablation flags from model_id
+        mid = configs.model_id if configs.model_id else ""
+        self.use_quaternion_block = "noQB" not in mid
+        use_quaternion_h2n = "noQH" not in mid
+        use_spiking = "noSP" not in mid
+        use_causal_mask = "noCM" not in mid
+
+        # HyperIMTS core
         self.hypergraph_encoder = HypergraphEncoder(self.enc_in, tl, D)
-        self.hypergraph_learner = HypergraphLearner(configs.n_layers, D, configs.n_heads, tl)
+        self.hypergraph_learner = HypergraphLearner(
+            configs.n_layers, D, configs.n_heads, tl,
+            use_quaternion_h2n=use_quaternion_h2n,
+            use_spiking=use_spiking,
+            use_causal_mask=use_causal_mask)
         self.hypergraph_decoder = nn.Linear(3 * D, 1)
 
-        # QSH-Net additions
-        self.quat = QuaternionBlock(D, configs.dropout)
+        # QSH-Net: QuaternionBlock (only if enabled)
+        if self.use_quaternion_block:
+            self.quat = QuaternionBlock(D, configs.dropout)
 
     # Pad/flatten utilities (identical to HyperIMTS v2)
     def pad_and_flatten(self, tensor, mask, max_len):
@@ -480,8 +506,9 @@ class Model(nn.Module):
             x_L_flattened, x_y_mask_flattened, y_mask_L_flattened,
             x_y_mark, variable_indices_flattened, time_indices_flattened, N_OBSERVATIONS_MAX)
 
-        # === QSH-Net addition: Quaternion enrichment of node features ===
-        observation_nodes = self.quat(observation_nodes)
+        # === QSH-Net addition: Quaternion enrichment of node features (if enabled) ===
+        if self.use_quaternion_block:
+            observation_nodes = self.quat(observation_nodes)
 
         # === Compute Δt for time-aware spiking gates ===
         # Gather per-observation timestamps, then compute intervals

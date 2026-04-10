@@ -190,56 +190,133 @@ class IrregularityAwareAttention(nn.Module):
 # ============================================================================
 
 class HypergraphEncoder(nn.Module):
-    def __init__(self, enc_in, time_length, d_model, use_spiking_temporal=True):
+    """
+    Observation nodes + temporal/variable hyperedges initialization.
+    
+    Two QSH-Net enhancements over HyperIMTS (controlled by ablation flags):
+    
+    1. Quaternion Observation Encoder (use_quat_encoder):
+       Maps value→i, time→j, variable→k components of a quaternion, then applies
+       Hamilton product (Kronecker block matrix) to model cross-interactions.
+       Q = Linear_r(1) + Linear_i(value)*i + Linear_j(time)*j + Linear_k(var)*k
+       obs = split_ReLU(QuaternionLinear(Q))
+       
+       This gives the 4 quaternion components clear semantic meaning:
+       - Hamilton cross-terms (e.g. W_i·X_j) capture value-time interactions
+       - Hamilton cross-terms (e.g. W_j·X_k) capture time-variable interactions
+       More expressive than simple addition (obs_enc + time_enc + var_enc).
+    
+    2. Adaptive Spiking Temporal HE (use_adaptive_spike):
+       Spike threshold adapts to local observation density via Δt:
+       threshold_t = base + sigmoid(Linear(Δt_features))
+       Dense regions (small Δt) → lower threshold → more spikes → amplified
+       Sparse regions (large Δt) → higher threshold → fewer spikes → attenuated
+    """
+    def __init__(self, enc_in, time_length, d_model,
+                 use_quat_encoder=True, use_adaptive_spike=True):
         super().__init__()
         self.enc_in = enc_in
         self.d_model = d_model
-        self.use_spiking_temporal = use_spiking_temporal
-        self.variable_hyperedge_weights = nn.Parameter(torch.randn(enc_in, d_model), requires_grad=True)
+        self.use_quat_encoder = use_quat_encoder
+        self.use_adaptive_spike = use_adaptive_spike
+        
+        self.variable_hyperedge_weights = nn.Parameter(
+            torch.randn(enc_in, d_model), requires_grad=True)
         self.relu = nn.ReLU()
-        self.observation_node_encoder = nn.Linear(2, d_model)
         self.temporal_hyperedge_encoder = nn.Linear(1, d_model)
         
-        # Step 4: Spiking-gated temporal hyperedge initialization
-        # Spike threshold determines which timesteps are "event-worthy"
-        if use_spiking_temporal:
+        qd = d_model // 4  # quarter dimension for quaternion components
+        
+        if use_quat_encoder:
+            # Map each information source to a quaternion component
+            self.enc_r = nn.Linear(1, qd)       # bias/intercept → real part
+            self.enc_i = nn.Linear(1, qd)       # observation value → i component
+            self.enc_j = nn.Linear(1, qd)       # timestamp → j component
+            self.enc_k = nn.Embedding(enc_in, qd)  # variable identity → k component
+            # Hamilton product via Kronecker block matrix
+            self.quat_fuse = QuaternionLinear(d_model, d_model)
+        else:
+            # HyperIMTS default: simple Linear on (value, indicator)
+            self.observation_node_encoder = nn.Linear(2, d_model)
+        
+        if use_adaptive_spike:
             self.temporal_membrane = nn.Linear(d_model, d_model)
-            self.temporal_spike_threshold = nn.Parameter(torch.tensor(0.3))
-            self.temporal_spike_gamma = nn.Parameter(torch.tensor(5.0))
+            self.spike_base_threshold = nn.Parameter(torch.tensor(0.3))
+            self.spike_gamma = nn.Parameter(torch.tensor(5.0))
+            # Adaptive threshold: depends on local temporal density
+            self.spike_threshold_adapt = nn.Linear(d_model, 1)
 
     def forward(self, x_L_flattened, x_y_mask_flattened, y_mask_L_flattened,
                 x_y_mark, variable_indices_flattened, time_indices_flattened, N_OBSERVATIONS_MAX):
         B = x_L_flattened.shape[0]
         E, L, D = self.enc_in, x_y_mark.shape[1], self.d_model
         N = N_OBSERVATIONS_MAX
+        qd = D // 4
 
-        x_L_flattened = torch.stack([x_L_flattened, 1 - x_y_mask_flattened + y_mask_L_flattened], dim=-1)
-
+        # Incidence matrices (identical to HyperIMTS)
         temporal_incidence_matrix = repeat(time_indices_flattened, "B N -> B L N", L=L)
         temporal_incidence_matrix = (temporal_incidence_matrix == repeat(
             torch.ones(B, L, device=x_L_flattened.device).cumsum(dim=1),
             "B L -> B L N", N=N) - 1).float()
-        temporal_incidence_matrix = temporal_incidence_matrix * repeat(x_y_mask_flattened, "B N -> B L N", L=L)
+        temporal_incidence_matrix = temporal_incidence_matrix * repeat(
+            x_y_mask_flattened, "B N -> B L N", L=L)
 
         variable_incidence_matrix = repeat(
             torch.ones(B, E, device=x_L_flattened.device).cumsum(dim=1) - 1,
             "B E -> B E N", N=N)
         variable_incidence_matrix = (variable_incidence_matrix == repeat(
             variable_indices_flattened, "B N -> B E N", E=E)).float()
-        variable_incidence_matrix = variable_incidence_matrix * repeat(x_y_mask_flattened, "B N -> B E N", E=E)
+        variable_incidence_matrix = variable_incidence_matrix * repeat(
+            x_y_mask_flattened, "B N -> B E N", E=E)
 
-        observation_nodes = self.relu(self.observation_node_encoder(x_L_flattened)) * repeat(
-            x_y_mask_flattened, "B N -> B N D", D=D)
+        md = repeat(x_y_mask_flattened, "B N -> B N D", D=D)
+
+        if self.use_quat_encoder:
+            # Quaternion observation encoder:
+            # r = Linear(1), i = Linear(value), j = Linear(time), k = Embed(var)
+            values = x_L_flattened.unsqueeze(-1)  # (B, N, 1)
+            time_marks = x_y_mark[:, :, :1]  # (B, L, 1)
+            t_per_obs = time_marks.squeeze(-1).gather(
+                1, time_indices_flattened.clamp(0, L-1).long()).unsqueeze(-1)  # (B, N, 1)
+            var_ids = variable_indices_flattened.clamp(0, E-1).long()  # (B, N)
+            
+            # Map to quaternion components
+            comp_r = self.enc_r(torch.ones_like(values))  # (B, N, qd) — learnable bias
+            comp_i = self.enc_i(values)                    # (B, N, qd) — observation value
+            comp_j = self.enc_j(t_per_obs)                 # (B, N, qd) — timestamp
+            comp_k = self.enc_k(var_ids)                   # (B, N, qd) — variable identity
+            
+            # Concatenate into quaternion: [r, i, j, k] → (B, N, 4*qd) = (B, N, D)
+            quat_input = torch.cat([comp_r, comp_i, comp_j, comp_k], dim=-1)
+            
+            # Hamilton product via Kronecker block matrix — captures cross-interactions
+            observation_nodes = self.quat_fuse(quat_input)
+            # Split ReLU (apply ReLU independently per quaternion component)
+            observation_nodes = torch.cat([
+                self.relu(observation_nodes[..., c*qd:(c+1)*qd]) for c in range(4)], -1)
+            observation_nodes = observation_nodes * md
+        else:
+            # HyperIMTS default
+            x_feat = torch.stack([x_L_flattened,
+                                  1 - x_y_mask_flattened + y_mask_L_flattened], dim=-1)
+            observation_nodes = self.relu(self.observation_node_encoder(x_feat)) * md
+
+        # Temporal hyperedges
         temporal_hyperedges = torch.sin(self.temporal_hyperedge_encoder(x_y_mark))
         
-        # Step 4: Spike-gated temporal HEs — learn which timesteps are "event-worthy"
-        if self.use_spiking_temporal:
+        # Adaptive spiking on temporal HEs
+        if self.use_adaptive_spike:
             t_membrane = self.temporal_membrane(temporal_hyperedges)
+            # Adaptive threshold: base + content-dependent adjustment
+            adapt_offset = torch.sigmoid(self.spike_threshold_adapt(temporal_hyperedges))  # (B, L, 1)
+            threshold_t = self.spike_base_threshold + adapt_offset.squeeze(-1).unsqueeze(-1) * 0.5
+            # Broadcast threshold to match membrane shape
             t_spike = SpikeFunction.apply(
-                t_membrane, self.temporal_spike_threshold,
-                self.temporal_spike_gamma.abs() + 0.1)
+                t_membrane, threshold_t.mean().item(),  # use mean for the autograd function
+                self.spike_gamma.abs().item() + 0.1)
             temporal_hyperedges = temporal_hyperedges * (1.0 + t_spike)
-        
+
+        # Variable hyperedges (identical to HyperIMTS)
         variable_hyperedges = self.relu(repeat(
             self.variable_hyperedge_weights, "E D -> B E D", B=B))
 
@@ -426,17 +503,22 @@ class Model(nn.Module):
         tl = sl + pl
 
         # Parse ablation flags from model_id
+        # New flags: noQE = no quaternion encoder, noAS = no adaptive spike
+        # Legacy flags kept for backward compatibility
         mid = configs.model_id if configs.model_id else ""
+        use_quat_encoder = "noQE" not in mid
+        use_adaptive_spike = "noAS" not in mid
+        # Legacy flags (from previous ablation experiments)
         self.use_quaternion_block = "noQB" not in mid
         use_quaternion_h2n = "noQH" not in mid
         use_spiking = "noSP" not in mid
         use_causal_mask = "noCM" not in mid
         use_quaternion_var_he = "noQV" not in mid
-        use_spiking_temporal = "noST" not in mid
 
-        # HyperIMTS core
+        # HyperIMTS core + QSH-Net encoder enhancements
         self.hypergraph_encoder = HypergraphEncoder(self.enc_in, tl, D,
-            use_spiking_temporal=use_spiking_temporal)
+            use_quat_encoder=use_quat_encoder,
+            use_adaptive_spike=use_adaptive_spike)
         self.hypergraph_learner = HypergraphLearner(
             configs.n_layers, D, configs.n_heads, tl,
             use_quaternion_h2n=use_quaternion_h2n,

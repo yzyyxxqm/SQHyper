@@ -514,6 +514,7 @@ class Model(nn.Module):
         use_spiking = "noSP" not in mid
         use_causal_mask = "noCM" not in mid
         use_quaternion_var_he = "noQV" not in mid
+        self.use_quat_decoder = "noQD" not in mid
 
         # HyperIMTS core + QSH-Net encoder enhancements
         self.hypergraph_encoder = HypergraphEncoder(self.enc_in, tl, D,
@@ -526,6 +527,10 @@ class Model(nn.Module):
             use_causal_mask=use_causal_mask,
             use_quaternion_var_he=use_quaternion_var_he)
         self.hypergraph_decoder = nn.Linear(3 * D, 1)
+
+        # Quaternion decoder: Hamilton product on cat(obs, t_he, v_he) before final Linear
+        if self.use_quat_decoder:
+            self.quat_dec = QuaternionLinear(3 * D, 3 * D)
 
         # QSH-Net: QuaternionBlock (only if enabled)
         if self.use_quaternion_block:
@@ -648,11 +653,20 @@ class Model(nn.Module):
         # === Decode ===
         if self.configs.task_name in ['long_term_forecast', 'short_term_forecast', 'imputation']:
             D = self.d_model
-            pred_flattened = self.hypergraph_decoder(torch.cat([
+            dec_input = torch.cat([
                 observation_nodes,
                 temporal_hyperedges.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D)),
                 variable_hyperedges.gather(1, repeat(variable_indices_flattened, "B N -> B N D", D=D)),
-            ], dim=-1)).squeeze(-1)
+            ], dim=-1)  # (B, N, 3D)
+
+            # Quaternion decoder: Hamilton product for obs/time_he/var_he cross-interaction
+            if self.use_quat_decoder:
+                qd = dec_input.shape[-1] // 4
+                dec_input = self.quat_dec(dec_input)
+                dec_input = torch.cat([
+                    F.relu(dec_input[..., c*qd:(c+1)*qd]) for c in range(4)], -1)
+
+            pred_flattened = self.hypergraph_decoder(dec_input).squeeze(-1)
 
             if exp_stage in ["train", "val"]:
                 return {"pred": pred_flattened, "true": y_L_flattened, "mask": y_mask_L_flattened}

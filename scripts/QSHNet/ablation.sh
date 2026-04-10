@@ -89,20 +89,11 @@ run_one() {
 }
 
 for ds in USHCN HumanActivity P12; do
-    # New v9 configs
-    run_one "V9"  "QSHNet_noQB_noQH_noSP_noCM_noQV" "$ds"           # QE + AS (recommended)
-    run_one "QE"  "QSHNet_noQB_noQH_noSP_noCM_noQV_noAS" "$ds"      # Quaternion Encoder only
-    run_one "AS"  "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE" "$ds"      # Adaptive Spike only
-    run_one "E"   "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noAS" "$ds" # Pure HyperIMTS baseline
-    # Legacy configs (kept for reference)
-    run_one "A" "QSHNet" "$ds"
-    run_one "B" "QSHNet_noQB_noQH" "$ds"
-    run_one "C" "QSHNet_noSP" "$ds"
-    run_one "D" "QSHNet_noCM" "$ds"
-    run_one "F" "QSHNet_noQB_noQH_noSP_noQV_noST" "$ds"
-    run_one "G" "QSHNet_noQB_noQH_noSP" "$ds"
-    run_one "H" "QSHNet_noQB_noQH_noSP_noST" "$ds"
-    run_one "I" "QSHNet_noQB_noQH_noSP_noQV" "$ds"
+    # Final model candidates (v10)
+    run_one "QDAS" "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE" "$ds"           # QD + AS
+    run_one "QD"   "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noAS" "$ds"      # QD only
+    run_one "AS"   "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noQD" "$ds"      # AS only
+    run_one "E"    "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noAS_noQD" "$ds" # Pure HyperIMTS
 done
 
 echo ""

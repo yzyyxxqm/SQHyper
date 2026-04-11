@@ -89,11 +89,16 @@ run_one() {
 }
 
 for ds in USHCN HumanActivity P12; do
-    # Final model candidates (v10)
-    run_one "QDAS" "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE" "$ds"           # QD + AS
-    run_one "QD"   "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noAS" "$ds"      # QD only
-    run_one "AS"   "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noQD" "$ds"      # AS only
-    run_one "E"    "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noAS_noQD" "$ds" # Pure HyperIMTS
+    # Final model: QD + AS + QF (quaternion decoder + adaptive spike + quaternion fusion)
+    run_one "QDASF" "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE" "$ds"
+    # Isolate QF contribution
+    run_one "QF"    "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noAS_noQD" "$ds"
+    # Previous best: QD + AS (no QF)
+    run_one "QDAS"  "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noQF" "$ds"
+    # AS only (previous best single component)
+    run_one "AS"    "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noQD_noQF" "$ds"
+    # Pure HyperIMTS baseline
+    run_one "E"     "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE_noAS_noQD_noQF" "$ds"
 done
 
 echo ""

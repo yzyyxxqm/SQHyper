@@ -1,4 +1,5 @@
 # Code from: https://github.com/Ladbaby/PyOmniTS
+import os
 import sys
 from datetime import timedelta
 
@@ -6,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 file_path = sys.argv[1]
-outfile_path="~/.tsdm/rawdata/MIMIC_III_DeBrouwer2019/"
+outfile_path=os.path.expanduser("~/.tsdm/rawdata/MIMIC_III_DeBrouwer2019/")
 
 lab_df=pd.read_csv(file_path+"LAB_processed.csv")[["SUBJECT_ID","HADM_ID","CHARTTIME","VALUENUM","LABEL"]]
 inputs_df=pd.read_csv(file_path+"INPUTS_processed.csv")[["SUBJECT_ID","HADM_ID","CHARTTIME","AMOUNT","LABEL"]]

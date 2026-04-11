@@ -331,7 +331,7 @@ class HypergraphEncoder(nn.Module):
 class HypergraphLearner(nn.Module):
     def __init__(self, n_layers, d_model, n_heads, time_length,
                  use_quaternion_h2n=True, use_spiking=True, use_causal_mask=True,
-                 use_quaternion_var_he=True):
+                 use_quaternion_var_he=True, use_quat_fusion=True):
         super().__init__()
         self.n_layers = n_layers
         self.d_model = d_model
@@ -340,6 +340,7 @@ class HypergraphLearner(nn.Module):
         self.use_spiking = use_spiking
         self.use_causal_mask = use_causal_mask
         self.use_quaternion_var_he = use_quaternion_var_he
+        self.use_quat_fusion = use_quat_fusion
 
         # Identical to HyperIMTS: node→hyperedge attention
         self.node2temporal_hyperedge = nn.ModuleList([
@@ -351,6 +352,13 @@ class HypergraphLearner(nn.Module):
         self.node_self_update = nn.ModuleList([
             MultiHeadAttentionBlock(d_model, 3*d_model, 3*d_model, d_model, n_heads)
             for _ in range(n_layers)])
+
+        # Quaternion fusion: O(N) replacement for node_self_update's O(N²) attention.
+        # When node_self_update OOMs, this provides a richer fallback than plain Linear
+        # by using Hamilton product's cross-component coupling on cat(tg, vg, obs).
+        if use_quat_fusion:
+            self.quat_node_fuse = nn.ModuleList([
+                QuaternionLinear(3*d_model, d_model) for _ in range(n_layers)])
 
         # h2n: QuaternionLinear or plain Linear depending on ablation flag
         if use_quaternion_h2n:
@@ -447,12 +455,24 @@ class HypergraphLearner(nn.Module):
                             torch.cat([obs_updated, tg, vg], -1))) * md)
                 except:
                     self.oom_flag = True
-                    logger.warning("QSH-Net: CUDA OOM, switching to fallback path.")
+                    logger.warning("QSH-Net: CUDA OOM, switching to quaternion fusion fallback.")
 
             if self.oom_flag:
-                observation_nodes = self.activation(
-                    (observation_nodes + self.hyperedge2node[i](
-                        torch.cat([observation_nodes, tg, vg], -1))) * md)
+                # Quaternion fusion fallback: O(N) instead of O(N²)
+                # Hamilton product on cat(tg, vg, obs) captures cross-interactions
+                # between temporal, variable, and node information
+                if self.use_quat_fusion:
+                    qf = self.quat_node_fuse[i](torch.cat([tg, vg, observation_nodes], -1))
+                    # Split ReLU per quaternion component
+                    qd = qf.shape[-1] // 4
+                    qf = torch.cat([F.relu(qf[..., c*qd:(c+1)*qd]) for c in range(4)], -1)
+                    observation_nodes = self.activation(
+                        (observation_nodes + self.hyperedge2node[i](
+                            torch.cat([qf, tg, vg], -1))) * md)
+                else:
+                    observation_nodes = self.activation(
+                        (observation_nodes + self.hyperedge2node[i](
+                            torch.cat([observation_nodes, tg, vg], -1))) * md)
 
             # Spiking gate (only if enabled)
             if self.use_spiking:
@@ -515,6 +535,7 @@ class Model(nn.Module):
         use_causal_mask = "noCM" not in mid
         use_quaternion_var_he = "noQV" not in mid
         self.use_quat_decoder = "noQD" not in mid
+        use_quat_fusion = "noQF" not in mid
 
         # HyperIMTS core + QSH-Net encoder enhancements
         self.hypergraph_encoder = HypergraphEncoder(self.enc_in, tl, D,
@@ -525,7 +546,8 @@ class Model(nn.Module):
             use_quaternion_h2n=use_quaternion_h2n,
             use_spiking=use_spiking,
             use_causal_mask=use_causal_mask,
-            use_quaternion_var_he=use_quaternion_var_he)
+            use_quaternion_var_he=use_quaternion_var_he,
+            use_quat_fusion=use_quat_fusion)
         self.hypergraph_decoder = nn.Linear(3 * D, 1)
 
         # Quaternion decoder: Hamilton product on cat(obs, t_he, v_he) before final Linear

@@ -8,6 +8,7 @@ notes.md
 pytorch.bin
 *.code-workspace
 
+storage/
 log/
 logs/
 wandb/
@@ -65,5 +66,5 @@ coverage.xml
 *.pot
 
 # Sphinx documentation
-docs/_build/
+docs/
 models/CSDI/noise

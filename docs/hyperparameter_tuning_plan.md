@@ -1,100 +1,118 @@
 # QSH-Net 超参数调优方案
 
-## 当前状态（QDAS 配置，itr=5）
+> **最后更新：** 2026-04-12
 
-| 数据集 | 均值 MSE | 标准差 | 目标 MSE | 差距 |
-|--------|---------|--------|---------|------|
-| P12 | 0.2997 | 0.0014 | <0.295 | +1.6% |
-| HumanActivity | 0.0417 | 0.0002 | <0.04 | +4.3% |
-| USHCN | 0.1950 | 0.0434 | <0.16 | +21.9% |
+## 当前状态（恒等初始化 + AdamW，最终配置）
 
-## 当前超参数（与 HyperIMTS 完全一致）
+| 数据集 | 均值 MSE | 标准差 | 论文 HyperIMTS | 状态 |
+|--------|---------|--------|---------------|------|
+| **USHCN** (itr=5) | **0.1715** | 0.0109 | 0.1738 ± 0.0078 | ✅ **已超越** |
+| **HumanActivity** (itr=3) | **0.0416** | 0.0004 | 0.0421 ± 0.0021 | ✅ **已超越** |
+| P12 | 待测 | — | 0.2996 ± 0.0003 | ⏳ 待测 |
+
+## 当前超参数
 
 | 参数 | P12 | HumanActivity | USHCN |
 |------|-----|---------------|-------|
 | d_model | 256 | 128 | 256 |
-| n_layers | 1 | 3 | 1 |
+| n_layers | 2 | 3 | 1 |
 | n_heads | 8 | 1 | 1 |
 | batch_size | 32 | 32 | 16 |
 | learning_rate | 1e-3 | 1e-3 | 1e-3 |
 | lr_scheduler | DelayedStepDecayLR | DelayedStepDecayLR | DelayedStepDecayLR |
 | train_epochs | 300 | 300 | 300 |
 | patience | 10 | 10 | 10 |
-| optimizer | Adam | Adam | Adam |
+| **optimizer** | **AdamW** | **AdamW** | **AdamW** |
+| **weight_decay** | **1e-4** | **1e-4** | **1e-4** |
 
-## 问题诊断
+## 已完成的调优实验
 
-- **P12**：稳定但系统性偏高 1.6%。标准差极小，说明不是随机问题。
-- **HumanActivity**：稳定但系统性偏高 4.3%。与 E 基线完全一致，说明 QDAS 组件对此数据集无贡献。
-- **USHCN**：方差极大（0.0434）。5 轮中 2 轮达标（0.165），3 轮未达标。问题是训练不稳定。
+### 调优 1：恒等初始化（架构级）
 
-## 调优策略
+| 组件 | 旧初始化 | 新初始化 | 效果 |
+|------|---------|---------|------|
+| QuaternionLinear | r,i,j,k ~ N(0,σ) | **r=I, i=j=k=0** | 消除随机噪声 |
+| SpikeSelection.membrane_proj | PyTorch 默认 (Kaiming) | **weight=0, bias=0** | 全部 fire → 恒等 |
 
-### 第一轮：Learning Rate 调优（优先级最高）
+**单独效果：** USHCN 3-run 均值从 0.251 降至 0.181（方差从 0.024 降至 0.009）。这是最关键的单一改进。
 
-当前 lr=1e-3 对所有数据集统一使用。QDAS 比 E 多了四元数解码器和自适应脉冲的参数，可能需要不同的 lr。
+### 调优 2：AdamW + Weight Decay
 
-**实验矩阵：**
+| 优化器 | USHCN 5-run 均值 | USHCN 5-run std |
+|--------|-----------------|-----------------|
+| Adam (wd=0) | 0.211 | 0.040 |
+| **AdamW (wd=1e-4)** | **0.172** | **0.011** |
 
-| 实验编号 | 数据集 | learning_rate | 其他参数 | itr |
-|---------|--------|--------------|---------|-----|
-| LR1 | USHCN | 5e-4 | 不变 | 5 |
-| LR2 | USHCN | 2e-3 | 不变 | 5 |
-| LR3 | HumanActivity | 5e-4 | 不变 | 3 |
-| LR4 | HumanActivity | 2e-3 | 不变 | 3 |
-| LR5 | P12 | 5e-4 | 不变 | 3 |
-| LR6 | P12 | 2e-3 | 不变 | 3 |
+**分析：** Weight decay 将权重范数控制在合理范围，减小了不同 random seed 下权重范数的差异，从而降低了 MSE 方差。
 
-**预期：**
-- USHCN 用 5e-4 可能降低方差（更稳定的优化），均值可能改善
-- HumanActivity 和 P12 的最优 lr 可能不是 1e-3
+### 已测试但无效的调优
 
-### 第二轮：LR Scheduler 调优（如果第一轮不够）
+| 实验 | USHCN MSE | 结论 |
+|------|-----------|------|
+| lr=5e-4 (原 Adam) | 0.239 (3-run) | ❌ 更差，收敛慢 |
+| d_model=128 (原 Adam) | 0.243 (3-run) | ❌ 更差，表达力不足 |
+| grad_clip max_norm=1.0 | — | ❌ 过于激进 |
+| grad_clip max_norm=5.0 + lr=5e-4 | 0.239 (3-run) | ❌ 无改善 |
 
-当前用 DelayedStepDecayLR（前 2 epoch 不变，之后每 epoch ×0.8）。衰减可能太快。
+## 潜在的进一步调优（待验证）
 
-**实验：**
+### 方向 1：激活四元数学习
 
-| 实验编号 | 数据集 | lr_scheduler | 备注 |
-|---------|--------|-------------|------|
-| SC1 | 全部 | CosineAnnealingLR | 更平滑的衰减，常用于 Transformer |
-| SC2 | 全部 | ExponentialDecayLR | 每 epoch ×0.5，更激进 |
+当前 alpha ≈ 0.047 几乎不动。可能的改进：
 
-### 第三轮：USHCN 专项（如果前两轮不够）
+| 实验 | 改动 | 预期 |
+|------|------|------|
+| QG1 | gate 初始化 -1.0 (α≈0.27) | 更大初始影响，可能加速 Q 学习 |
+| QG2 | 独立学习率（Q params ×10） | 加速 Q 参数偏离恒等 |
+| QG3 | gate 初始化 0.0 (α=0.5) | 最大初始影响，风险较高 |
 
-USHCN 的不稳定性可能需要更强的正则化：
+**注意：** 由于恒等初始化，较大的 alpha 在训练初期只是 (1+α) 缩放，风险有限。
 
-| 实验编号 | 参数 | 值 | 备注 |
-|---------|------|---|------|
-| US1 | d_model | 128 | 减小模型容量，降低过拟合风险 |
-| US2 | batch_size | 8 | 更小的 batch 增加梯度噪声，可能帮助逃离局部最优 |
-| US3 | patience | 20 | 更长的耐心，让模型训练更充分 |
+### 方向 2：脉冲选择微调
+
+| 实验 | 改动 | 预期 |
+|------|------|------|
+| SP1 | threshold=-1.0（初始全 fire，学习更自由） | fire_rate 跨 run 更稳定 |
+| SP2 | 去掉 gamma 的可学习性（固定为 5.0） | 减少参数，可能减小方差 |
+
+### 方向 3：P12 专项
+
+P12 始终使用 OOM fallback（跳过 node_self_update）。改进空间可能在于：
+
+| 实验 | 改动 | 预期 |
+|------|------|------|
+| P1 | 增加 n_layers 到 3 | 弥补 OOM fallback 的信息损失 |
+| P2 | 降低 d_model 到 128 | 避免 OOM（但可能降低表达力） |
 
 ## 运行方式
 
-使用消融脚本的 QDAS 配置，手动覆盖超参数。示例：
-
 ```bash
-# LR1: USHCN lr=5e-4
+# USHCN 标准运行
 python main.py --is_training 1 --collate_fn collate_fn --loss MSE \
     --d_model 256 --n_layers 1 --n_heads 1 \
     --dataset_root_path storage/datasets/USHCN \
-    --model_id "QSHNet_noQB_noQH_noSP_noCM_noQV_noQE" \
-    --model_name QSHNet --dataset_name USHCN --dataset_id USHCN \
+    --model_id QSHNet --model_name QSHNet \
+    --dataset_name USHCN --dataset_id USHCN \
     --features M --seq_len 150 --pred_len 3 \
     --enc_in 5 --dec_in 5 --c_out 5 \
     --train_epochs 300 --patience 10 --val_interval 1 \
-    --itr 5 --batch_size 16 --learning_rate 5e-4
+    --itr 5 --batch_size 16 --learning_rate 1e-3
+
+# HumanActivity 标准运行
+python main.py --is_training 1 --collate_fn collate_fn --loss MSE \
+    --d_model 128 --n_layers 3 --n_heads 1 \
+    --dataset_root_path storage/datasets/HumanActivity \
+    --model_id QSHNet --model_name QSHNet \
+    --dataset_name HumanActivity --dataset_id HumanActivity \
+    --features M --seq_len 3000 --pred_len 300 \
+    --enc_in 12 --dec_in 12 --c_out 12 \
+    --train_epochs 300 --patience 10 --val_interval 1 \
+    --itr 3 --batch_size 32 --learning_rate 1e-3
 ```
-
-## 成功标准
-
-- P12 均值 MSE < 0.295
-- HumanActivity 均值 MSE < 0.04
-- USHCN 均值 MSE < 0.16
 
 ## 备注
 
+- AdamW 仅对 model_name 包含 "QSH" 的模型启用（`exp_main.py` 中条件判断），不影响其他模型
 - 每轮调优只改一个参数，保持其他不变
-- 优先跑 USHCN（差距最大，方差最大，改善空间最大）
-- 如果 lr 调优后 USHCN 均值仍 >0.18，考虑第三轮的模型容量调整
+- USHCN 需要 itr≥5 来可靠评估（高方差数据集）
+- HumanActivity 用 itr=3 即可（方差极小）

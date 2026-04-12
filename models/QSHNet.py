@@ -1,23 +1,22 @@
 # QSH-Net: Quaternion-Spiking-Hypergraph Network for IMTS Forecasting
 #
-# Architecture: HyperIMTS core + three organic enhancements:
+# Three modules form a signal processing pipeline:
+#   obs → [Spiking: event detection] → [Hypergraph: message passing] → [Quaternion: refinement]
 #
-# 1. Spike Selection (before message passing):
-#    Observation nodes pass through a spiking neuron before participating in
-#    node-to-hyperedge aggregation. Only nodes whose membrane potential exceeds
-#    the threshold "fire" and fully participate; others are attenuated.
-#    This implements event-driven sparse communication — the model learns which
-#    observations carry meaningful signal vs noise.
+# Core design: IDENTITY INITIALIZATION — all QSH enhancements start as exact identity,
+# so the model begins as pure HyperIMTS and learns to deviate only when beneficial.
 #
-# 2. Quaternion Parallel Branch (in h2n fusion):
-#    The hyperedge-to-node fusion has two parallel paths:
-#    - Original Linear(3D, D) path (same as HyperIMTS)
-#    - QuaternionLinear(3D, D) path (Hamilton product cross-coupling)
-#    A learnable gate α blends the two: output = (1-α)*Linear + α*Quaternion
-#    This way quaternion provides structured cross-interaction of obs/tg/vg
-#    without replacing the original path. Worst case: α→0, degrades to HyperIMTS.
+# 1. Context-Aware Spike Selection (before n2h):
+#    Uses H's variable_incidence_matrix to compute per-variable context.
+#    Fires when observation deviates from its variable's context.
+#    Zero-init membrane_proj → all fire at start → identity.
 #
-# 3. All other HyperIMTS components are preserved exactly as-is.
+# 2. Quaternion Refinement (in h2n):
+#    Additive refinement: h2n_out = linear_out + α · QuatLinear(linear_out)
+#    Identity-init QuaternionLinear (r=I, i=j=k=0) → starts as (1+α)·linear_out.
+#    Hamilton product learns cross-feature-group interactions during training.
+#
+# 3. Hypergraph core (identical to HyperIMTS): n2h attention, h2h, node_self_update.
 
 import math
 import torch
@@ -43,9 +42,11 @@ class QuaternionLinear(nn.Module):
         self.j = nn.Parameter(torch.empty(qo, qi))
         self.k = nn.Parameter(torch.empty(qo, qi))
         self.bias = nn.Parameter(torch.zeros(out_f)) if bias else None
-        s = (2.0 * qi) ** -0.5
-        for w in [self.r, self.i, self.j, self.k]:
-            nn.init.normal_(w, 0, s)
+        # Identity init: r=I, i=j=k=0 → quat_linear(x)=x at start
+        nn.init.eye_(self.r)
+        nn.init.zeros_(self.i)
+        nn.init.zeros_(self.j)
+        nn.init.zeros_(self.k)
 
     def forward(self, x):
         r, i, j, k = self.r, self.i, self.j, self.k
@@ -79,34 +80,58 @@ class SpikeFunction(torch.autograd.Function):
 
 class SpikeSelection(nn.Module):
     """
-    Before node-to-hyperedge aggregation, each observation node's membrane
-    potential is computed. Nodes that fire (spike=1) participate fully;
-    nodes that don't fire are attenuated by factor (1-attenuation).
+    Context-aware event-driven node filtering before message passing.
     
-    This is NOT a post-hoc gate — it filters BEFORE message passing,
-    so hyperedges only aggregate from "event-worthy" observations.
+    Uses the hypergraph's variable incidence matrix to compute each variable's
+    aggregate context. An observation "fires" (spike=1) when it deviates from
+    its variable's context — i.e., it carries novel information worth propagating.
+    Non-firing observations are attenuated (not zeroed) to preserve gradient flow.
+    
+    Membrane potential is a scalar per observation (Linear(2D, 1)), not a
+    D-dimensional vector — this is a binary event decision, not a feature transform.
     """
     def __init__(self, d_model):
         super().__init__()
-        self.membrane_proj = nn.Linear(d_model, d_model)
-        self.threshold = nn.Parameter(torch.tensor(0.3))
+        self.membrane_proj = nn.Linear(d_model * 2, 1)
+        # Zero-init: membrane=0 for all obs → all fire (0>=0=True) → identity at start
+        nn.init.zeros_(self.membrane_proj.weight)
+        nn.init.zeros_(self.membrane_proj.bias)
+        self.threshold = nn.Parameter(torch.tensor(0.0))
         self.gamma = nn.Parameter(torch.tensor(5.0))
-        # Attenuation factor for non-firing nodes (learnable, starts at 0.5)
-        self.log_attenuation = nn.Parameter(torch.tensor(0.0))
+        self.log_attenuation = nn.Parameter(torch.tensor(4.0))
 
-    def forward(self, obs, mask_d):
+    def forward(self, obs, mask_d, variable_incidence_matrix, variable_indices_flattened):
         """
         obs: (B, N, D) observation node features
-        mask_d: (B, N, D) observation mask
+        mask_d: (B, N, D) observation mask (expanded)
+        variable_incidence_matrix: (B, E, N) which obs belongs to which variable
+        variable_indices_flattened: (B, N) variable index per observation
         Returns: (B, N, D) spike-selected features
         """
-        membrane = self.membrane_proj(obs)
+        D = obs.shape[-1]
+        # Compute per-variable context via hypergraph structure
+        var_count = variable_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)  # (B, E, 1)
+        var_context = (variable_incidence_matrix @ obs) / var_count  # (B, E, D)
+        obs_var_ctx = var_context.gather(
+            1, repeat(variable_indices_flattened, "B N -> B N D", D=D))  # (B, N, D)
+        # Membrane: how much does this observation deviate from its variable's context?
+        deviation = obs - obs_var_ctx
+        membrane = self.membrane_proj(
+            torch.cat([obs, deviation], dim=-1)).squeeze(-1)  # (B, N)
+        # Spike firing
         spike = SpikeFunction.apply(membrane, self.threshold, self.gamma.abs() + 0.1)
-        # Firing nodes: full signal. Non-firing: attenuated (not zeroed)
-        attn = torch.sigmoid(self.log_attenuation)  # in (0, 1)
-        # spike=1 → weight=1, spike=0 → weight=attn
-        weight = spike + (1.0 - spike) * attn
-        return obs * weight * mask_d
+        # Firing→full signal, non-firing→attenuated
+        attn = torch.sigmoid(self.log_attenuation)
+        weight = spike + (1.0 - spike) * attn  # (B, N)
+        # Diagnostic logging (every 200 forward calls)
+        if not hasattr(self, '_fwd_count'):
+            self._fwd_count = 0
+        self._fwd_count += 1
+        if self._fwd_count % 200 == 1:
+            fire_rate = spike.mean().item()
+            logger.info(f"[Spike] fire_rate={fire_rate:.3f} attn={attn.item():.3f} "
+                        f"threshold={self.threshold.item():.3f} gamma={self.gamma.item():.3f}")
+        return obs * weight.unsqueeze(-1) * mask_d
 
 
 # ============================================================================
@@ -189,8 +214,6 @@ class HypergraphEncoder(nn.Module):
         self.relu = nn.ReLU()
         self.observation_node_encoder = nn.Linear(2, d_model)
         self.temporal_hyperedge_encoder = nn.Linear(1, d_model)
-        # Δt-aware: encode observation density per timestep
-        self.density_encoder = nn.Linear(1, d_model)
 
     def forward(self, x_L_flattened, x_y_mask_flattened, y_mask_L_flattened,
                 x_y_mark, variable_indices_flattened, time_indices_flattened, N_OBSERVATIONS_MAX):
@@ -216,10 +239,6 @@ class HypergraphEncoder(nn.Module):
         observation_nodes = self.relu(self.observation_node_encoder(x_L_flattened)) * repeat(
             x_y_mask_flattened, "B N -> B N D", D=D)
         temporal_hyperedges = torch.sin(self.temporal_hyperedge_encoder(x_y_mark))
-        # Density encoding: how many observations at each timestep
-        # density = row sum of temporal incidence matrix → (B, L)
-        density = temporal_incidence_matrix.sum(dim=-1, keepdim=True)  # (B, L, 1)
-        temporal_hyperedges = temporal_hyperedges + self.density_encoder(density)
         variable_hyperedges = self.relu(repeat(self.variable_hyperedge_weights, "E D -> B E D", B=B))
 
         return (observation_nodes, temporal_hyperedges, variable_hyperedges,
@@ -258,20 +277,14 @@ class HypergraphLearner(nn.Module):
         self.spike_select = nn.ModuleList([
             SpikeSelection(d_model) for _ in range(n_layers)])
 
-        # === QSH-Net Enhancement 2: Quaternion Parallel Branch (per layer) ===
-        # Parallel to hyperedge2node Linear, with learnable blending gate
+        # === QSH-Net Enhancement 2: Quaternion Refinement (per layer) ===
+        # QuaternionLinear refines linear output via Hamilton product cross-coupling
+        # of 4 feature groups within the fused representation
         self.quat_h2n = nn.ModuleList([
-            QuaternionLinear(3*d_model, d_model) for _ in range(n_layers)])
+            QuaternionLinear(d_model, d_model) for _ in range(n_layers)])
         # Gate α: initialized near 0 so model starts as pure HyperIMTS
         self.quat_gate = nn.ParameterList([
-            nn.Parameter(torch.tensor(-2.0)) for _ in range(n_layers)])  # sigmoid(-2)≈0.12
-
-        # === QSH-Net Enhancement 3: Temporal HE causal communication ===
-        # Causal depthwise conv lets adjacent temporal HEs share information
-        # kernel_size=5: each temporal HE sees 4 past HEs
-        self.temporal_he_conv = nn.ModuleList([
-            nn.Conv1d(d_model, d_model, kernel_size=5, padding=4, groups=d_model)
-            for _ in range(n_layers)])
+            nn.Parameter(torch.tensor(-3.0)) for _ in range(n_layers)])  # sigmoid(-3)≈0.047
 
     def get_fine_grained_embedding(self, tensor_flattened, target_shape):
         """Identical to HyperIMTS."""
@@ -296,9 +309,11 @@ class HypergraphLearner(nn.Module):
 
             md = repeat(x_y_mask_flattened, "B N -> B N D", D=D)
 
-            # === Enhancement 1: Spike Selection BEFORE message passing ===
-            # Filter observation nodes: only "event-worthy" nodes fully participate
-            obs_selected = self.spike_select[i](observation_nodes, md)
+            # === Enhancement 1: Context-Aware Spike Selection BEFORE message passing ===
+            # Uses variable incidence matrix to detect observations that deviate from
+            # their variable's context — true event-driven filtering
+            obs_selected = self.spike_select[i](
+                observation_nodes, md, variable_incidence_matrix, variable_indices_flattened)
 
             # Node→temporal hyperedge (using spike-selected nodes)
             temporal_hyperedges_updated = self.node2temporal_hyperedge[i](
@@ -321,42 +336,42 @@ class HypergraphLearner(nn.Module):
             variable_hyperedges = variable_hyperedges_updated
             temporal_hyperedges = temporal_hyperedges_updated
 
-            # === Enhancement 3: Temporal HE causal communication ===
-            # Let adjacent temporal hyperedges share information (local time trends)
-            L_t = temporal_hyperedges.shape[1]
-            t_conv = self.temporal_he_conv[i](
-                temporal_hyperedges.transpose(1, 2))[:, :, :L_t].transpose(1, 2)
-            temporal_hyperedges = temporal_hyperedges + t_conv
-
             # Hyperedge→node
             tg = temporal_hyperedges.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D))
             vg = variable_hyperedges.gather(1, repeat(variable_indices_flattened, "B N -> B N D", D=D))
 
             if not self.oom_flag:
                 try:
-                    obs_updated = self.node_self_update[i](
+                    obs_for_h2n = self.node_self_update[i](
                         observation_nodes,
                         torch.cat([tg, vg, observation_nodes], -1),
                         x_y_mask_flattened.unsqueeze(2) * x_y_mask_flattened.unsqueeze(1))
-                    h2n_input = torch.cat([obs_updated, tg, vg], -1)
+                    h2n_input = torch.cat([obs_for_h2n, tg, vg], -1)
                 except:
                     self.oom_flag = True
                     logger.warning("QSH-Net: CUDA OOM, using fallback.")
 
             if self.oom_flag:
-                h2n_input = torch.cat([observation_nodes, tg, vg], -1)
+                obs_for_h2n = observation_nodes
+                h2n_input = torch.cat([obs_for_h2n, tg, vg], -1)
 
-            # === Enhancement 2: Quaternion Parallel Branch ===
+            # === Enhancement 2: Quaternion Refinement ===
             # Linear path (HyperIMTS original)
             linear_out = self.hyperedge2node[i](h2n_input)
-            # Quaternion path (Hamilton product cross-coupling)
-            quat_out = self.quat_h2n[i](h2n_input)
-            # Split ReLU on quaternion output
-            qd = quat_out.shape[-1] // 4
-            quat_out = torch.cat([F.relu(quat_out[..., c*qd:(c+1)*qd]) for c in range(4)], -1)
-            # Blend with learnable gate (initialized near 0 → starts as pure HyperIMTS)
+            # Quaternion refines linear output: Hamilton product captures cross-feature
+            # interactions within the fused representation that a single linear misses
+            quat_out = self.quat_h2n[i](linear_out)
+            # Additive refinement with learnable gate (starts near 0 → pure HyperIMTS)
             alpha = torch.sigmoid(self.quat_gate[i])
-            h2n_out = (1 - alpha) * linear_out + alpha * quat_out
+            h2n_out = linear_out + alpha * quat_out
+            # Diagnostic logging
+            if not hasattr(self, '_h2n_count'):
+                self._h2n_count = 0
+            self._h2n_count += 1
+            if self._h2n_count % 200 == 1:
+                logger.info(f"[Quat L{i}] alpha={alpha.item():.4f} "
+                            f"|linear|={linear_out.norm().item():.2f} "
+                            f"|quat|={quat_out.norm().item():.2f}")
 
             observation_nodes = self.activation((observation_nodes + h2n_out) * md)
 

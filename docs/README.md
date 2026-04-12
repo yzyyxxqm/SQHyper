@@ -1,1 +1,0 @@
-PyOmniTS docs have been moved to [here](https://ladbaby.github.io/PyOmniTS-docs/).

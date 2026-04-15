@@ -78,7 +78,7 @@ class SpikeFunction(torch.autograd.Function):
 # Spike Selection: event-driven node filtering before message passing
 # ============================================================================
 
-class SpikeSelection(nn.Module):
+class SpikeRouter(nn.Module):
     """
     Context-aware event-driven node filtering before message passing.
     
@@ -96,9 +96,13 @@ class SpikeSelection(nn.Module):
         # Zero-init: membrane=0 for all obs → all fire (0>=0=True) → identity at start
         nn.init.zeros_(self.membrane_proj.weight)
         nn.init.zeros_(self.membrane_proj.bias)
+        self.event_proj = nn.Linear(d_model * 2, d_model)
+        nn.init.zeros_(self.event_proj.weight)
+        nn.init.zeros_(self.event_proj.bias)
         self.threshold = nn.Parameter(torch.tensor(0.0))
         self.gamma = nn.Parameter(torch.tensor(5.0))
-        self.log_attenuation = nn.Parameter(torch.tensor(4.0))
+        self.retain_log_scale = nn.Parameter(torch.tensor(0.0))
+        self.event_log_scale = nn.Parameter(torch.tensor(-8.0))
 
     def forward(self, obs, mask_d, variable_incidence_matrix, variable_indices_flattened):
         """
@@ -106,7 +110,7 @@ class SpikeSelection(nn.Module):
         mask_d: (B, N, D) observation mask (expanded)
         variable_incidence_matrix: (B, E, N) which obs belongs to which variable
         variable_indices_flattened: (B, N) variable index per observation
-        Returns: (B, N, D) spike-selected features
+        Returns: base path, event path, route diagnostics
         """
         D = obs.shape[-1]
         # Compute per-variable context via hypergraph structure
@@ -118,20 +122,29 @@ class SpikeSelection(nn.Module):
         deviation = obs - obs_var_ctx
         membrane = self.membrane_proj(
             torch.cat([obs, deviation], dim=-1)).squeeze(-1)  # (B, N)
-        # Spike firing
-        spike = SpikeFunction.apply(membrane, self.threshold, self.gamma.abs() + 0.1)
-        # Firing→full signal, non-firing→attenuated
-        attn = torch.sigmoid(self.log_attenuation)
-        weight = spike + (1.0 - spike) * attn  # (B, N)
+        route_logit = membrane
+        retain_strength = torch.exp(self.retain_log_scale) - 1.0
+        retain_gate = 1.0 - retain_strength * torch.sigmoid(-route_logit)
+        event_gate = torch.exp(self.event_log_scale) * torch.sigmoid(route_logit)
+        event_features = self.event_proj(torch.cat([obs, deviation], dim=-1))
+        obs_base = obs * retain_gate.unsqueeze(-1) * mask_d
+        obs_event = event_features * event_gate.unsqueeze(-1) * mask_d
         # Diagnostic logging (every 200 forward calls)
         if not hasattr(self, '_fwd_count'):
             self._fwd_count = 0
         self._fwd_count += 1
         if self._fwd_count % 200 == 1:
-            fire_rate = spike.mean().item()
-            logger.info(f"[Spike] fire_rate={fire_rate:.3f} attn={attn.item():.3f} "
+            logger.info(f"[Spike] retain={retain_gate.mean().item():.3f} event={event_gate.mean().item():.5f} "
                         f"threshold={self.threshold.item():.3f} gamma={self.gamma.item():.3f}")
-        return obs * weight.unsqueeze(-1) * mask_d
+        return obs_base, obs_event, {
+            "retain_gate": retain_gate,
+            "event_gate": event_gate,
+            "route_logit": route_logit,
+        }
+
+
+class SpikeSelection(SpikeRouter):
+    pass
 
 
 # ============================================================================
@@ -275,16 +288,20 @@ class HypergraphLearner(nn.Module):
 
         # === QSH-Net Enhancement 1: Spike Selection (per layer) ===
         self.spike_select = nn.ModuleList([
-            SpikeSelection(d_model) for _ in range(n_layers)])
+            SpikeRouter(d_model) for _ in range(n_layers)])
+        self.event_residual_scale = nn.ParameterList([
+            nn.Parameter(torch.tensor(0.0)) for _ in range(n_layers)])
 
         # === QSH-Net Enhancement 2: Quaternion Refinement (per layer) ===
         # QuaternionLinear refines linear output via Hamilton product cross-coupling
         # of 4 feature groups within the fused representation
         self.quat_h2n = nn.ModuleList([
             QuaternionLinear(d_model, d_model) for _ in range(n_layers)])
-        # Gate α: initialized near 0 so model starts as pure HyperIMTS
-        self.quat_gate = nn.ParameterList([
-            nn.Parameter(torch.tensor(-3.0)) for _ in range(n_layers)])  # sigmoid(-3)≈0.047
+        self.quat_gate = nn.ModuleList([
+            nn.Linear(d_model + 1, 1) for _ in range(n_layers)])
+        for gate in self.quat_gate:
+            nn.init.zeros_(gate.weight)
+            nn.init.constant_(gate.bias, -3.0)
 
     def get_fine_grained_embedding(self, tensor_flattened, target_shape):
         """Identical to HyperIMTS."""
@@ -296,6 +313,10 @@ class HypergraphLearner(nn.Module):
         result = torch.zeros(B, L, E, nd, dtype=tf.dtype, device=tf.device)
         result.masked_scatter_(mask, tf)
         return rearrange(result, "B L E D -> B E (L D)")
+
+    def compute_quaternion_gate(self, layer_idx, linear_out, event_gate):
+        gate_input = torch.cat([linear_out, event_gate.unsqueeze(-1)], dim=-1)
+        return torch.sigmoid(self.quat_gate[layer_idx](gate_input))
 
     def forward(self, observation_nodes, temporal_hyperedges, variable_hyperedges,
                 time_indices_flattened, variable_indices_flattened,
@@ -312,15 +333,19 @@ class HypergraphLearner(nn.Module):
             # === Enhancement 1: Context-Aware Spike Selection BEFORE message passing ===
             # Uses variable incidence matrix to detect observations that deviate from
             # their variable's context — true event-driven filtering
-            obs_selected = self.spike_select[i](
+            obs_base, obs_event, route_state = self.spike_select[i](
                 observation_nodes, md, variable_incidence_matrix, variable_indices_flattened)
+            event_scale = torch.exp(self.event_residual_scale[i]) - 1.0
+            temporal_event_delta = (temporal_incidence_matrix @ obs_event) / temporal_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
+            variable_event_delta = (variable_incidence_matrix @ obs_event) / variable_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
 
             # Node→temporal hyperedge (using spike-selected nodes)
             temporal_hyperedges_updated = self.node2temporal_hyperedge[i](
                 temporal_hyperedges,
                 torch.cat([variable_hyperedges.gather(1, repeat(variable_indices_flattened, "B N -> B N D", D=D)),
-                           obs_selected], -1),
+                           obs_base], -1),
                 temporal_incidence_matrix if i != 0 else temporal_incidence_matrix * mask_temp)
+            temporal_hyperedges_updated = temporal_hyperedges_updated + event_scale * temporal_event_delta
 
             if i == 0:
                 mask_temp = 1 - repeat(y_mask_L_flattened, "B N -> B E N", E=variable_incidence_matrix.shape[1])
@@ -330,8 +355,9 @@ class HypergraphLearner(nn.Module):
             variable_hyperedges_updated = self.node2variable_hyperedge[i](
                 variable_hyperedges,
                 torch.cat([temporal_hyperedges.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D)),
-                           obs_selected], -1),
+                           obs_base], -1),
                 variable_incidence_matrix if i != 0 else variable_incidence_matrix * mask_temp)
+            variable_hyperedges_updated = variable_hyperedges_updated + event_scale * variable_event_delta
 
             variable_hyperedges = variable_hyperedges_updated
             temporal_hyperedges = temporal_hyperedges_updated
@@ -362,14 +388,14 @@ class HypergraphLearner(nn.Module):
             # interactions within the fused representation that a single linear misses
             quat_out = self.quat_h2n[i](linear_out)
             # Additive refinement with learnable gate (starts near 0 → pure HyperIMTS)
-            alpha = torch.sigmoid(self.quat_gate[i])
+            alpha = self.compute_quaternion_gate(i, linear_out, route_state["event_gate"])
             h2n_out = linear_out + alpha * quat_out
             # Diagnostic logging
             if not hasattr(self, '_h2n_count'):
                 self._h2n_count = 0
             self._h2n_count += 1
             if self._h2n_count % 200 == 1:
-                logger.info(f"[Quat L{i}] alpha={alpha.item():.4f} "
+                logger.info(f"[Quat L{i}] alpha={alpha.mean().item():.4f} event={route_state['event_gate'].mean().item():.5f} "
                             f"|linear|={linear_out.norm().item():.2f} "
                             f"|quat|={quat_out.norm().item():.2f}")
 

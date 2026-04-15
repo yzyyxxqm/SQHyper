@@ -162,3 +162,82 @@ v1~v8 的反复失败证明：任何改变 HyperIMTS 核心消息传递机制的
 3. 四元数门控 alpha ≈ 0.047 几乎不动——可能需要更高的初始值或独立学习率
 4. 脉冲 fire_rate 跨 run 变化很大
 5. **MIMIC_III 改善 7.7% 的机理需要深入分析**
+
+---
+
+## 有机融合重设计实验（2026-04-14~15，已全部回退）
+
+### 背景与动机
+
+旧版 QSH-Net 的 Spike 和 Quaternion 是"贴"在超图上的，不是"长"在超图里的：
+- SpikeSelection 只在消息传递前做标量加权（fire_rate=16%, attenuation=98.2%，区分度仅 1.8%）
+- QuaternionLinear 只在融合后做残差补充（alpha≈0.047 几乎不动）
+- 超图的消息传递本身完全没变
+
+目标：让四元数和脉冲有机融合进超图消息传递的核心机制中。
+
+### 设计 A：QuaternionStructuredFusion + SpikeTemperature
+
+**QuaternionStructuredFusion**（替换 Linear(3D, D)）：
+- obs/tg/vg 分别投影为四元数的 i/j/k 分量，线性融合作为实部 r
+- Hamilton 积（Kronecker 块矩阵）自动产生跨源交互：时间×变量、变量×节点、节点×时间
+- 输出取实部
+
+**SpikeTemperature**（替换 SpikeSelection）：
+- 脉冲信号调制 n2h 注意力的温度（而非标量加权）
+- 偏离变量上下文 → 低温度 → 尖锐注意力；符合上下文 → 高温度 → 平滑注意力
+
+### 实验 A1：D/4 维分量 + D×D Kronecker（首版）
+
+每个四元数分量投影到 D/4 维，Kronecker 块矩阵 (D×D)，子矩阵 (D/4×D/4)。
+
+**USHCN itr=5 结果：** 0.235, 0.246, 0.225, 0.275, 0.169 → 均值 0.230 ± 0.037
+
+**失败原因：** D/4 瓶颈——每个分量只有 64 维（D=256），三源融合信息从 256 维压缩到 64 维，丢失 75% 信息。与之前"语义四元数"失败的原因完全一致。
+
+### 实验 A2：全 D 维分量 + 4D×4D Kronecker
+
+每个分量保持完整 D=256 维，Kronecker 块矩阵 (4D×4D)=(1024×1024)，子矩阵 (D×D)=(256×256)。输出取实部（前 D 维）。
+
+**USHCN itr=3 结果：** 0.166, 0.249, 0.182 → 均值 0.199 ± 0.037
+
+**问题：** 参数量爆炸（4×D² = 262K per layer），且 `proj_r` 的随机初始化破坏了恒等初始化——训练起点不是纯 HyperIMTS。
+
+### 实验 A3：修复恒等初始化（Linear 主路径 + Hamilton 积残差 + gate=0）
+
+保留原始 `Linear(3D, D)` 作为主路径，Hamilton 积作为残差补充，gate 初始化为 0（tanh(0)=0）确保精确恒等初始化。
+
+**USHCN itr=3 结果（含 SpikeTemperature）：** 0.193, 0.212, 0.195 → 均值 0.200 ± 0.010
+
+**分析：** 方差大幅降低（0.010 vs 0.037），恒等初始化修复有效。但均值 0.200 仍比旧版（0.187）差。
+
+### 实验 A4：消融——去掉 SpikeTemperature
+
+只保留 QuaternionStructuredFusion，n2h 注意力回到标准 MultiHeadAttentionBlock。
+
+**USHCN itr=3 结果：** 0.215, 0.161, 0.164 → 均值 0.180 ± 0.030
+
+**关键发现：SpikeTemperature 在伤害性能**（去掉后从 0.200 改善到 0.180）。温度调制在 USHCN（仅 5 变量）上区分度太低，反而引入噪声。
+
+### 实验 A4 全数据集评估
+
+| 数据集 | QuatFusion only | 旧版 QSH-Net | HyperIMTS 论文 |
+|--------|----------------|-------------|---------------|
+| HumanActivity (itr=5) | 0.0417 ± 0.0003 | 0.0416 ± 0.0003 | 0.0421 ± 0.0021 |
+| P12 (itr=5) | 0.3021 ± 0.0015 | 0.3006 ± 0.0013 | 0.2996 ± 0.0003 |
+| MIMIC_III (itr=5) | 0.4015 ± 0.0115 | **0.3933 ± 0.0060** | 0.4259 ± 0.0021 |
+| USHCN (itr=3) | 0.180 ± 0.030 | 0.187 ± 0.028 | 0.174 ± 0.008 |
+
+**结论：** QuaternionStructuredFusion 在 MIMIC_III 上退步（0.401 vs 0.393），方差翻倍（0.012 vs 0.006）。其他数据集基本持平。
+
+### 核心教训
+
+1. **D/4 瓶颈是致命的**：四元数的 4 分量结构天然要求将 D 维切成 4 份，这在 D=256 时丢失太多信息
+2. **恒等初始化必须精确**：任何新的 Linear 层（如 proj_r）如果不和原始 HyperIMTS 的 Linear 共享权重，就会破坏恒等初始化
+3. **SpikeTemperature 在低变量数数据集上有害**：温度调制需要足够的变量多样性才能产生有意义的区分
+4. **Hamilton 积的结构约束不一定优于自由 Linear**：在 MIMIC_III 上，旧版的 `Linear(3D,D) + α*QuatLinear(linear_out)` 比新版的结构化融合效果更好
+5. **旧版的"拼接"设计虽然不够优雅，但恒等初始化 + 加法残差的安全性是其成功的关键**
+
+### 决策
+
+所有新设计实验已回退，恢复到旧版 QSH-Net（SpikeSelection + QuaternionLinear 加法精炼）。该版本在 5 个数据集中 3 个超越 HyperIMTS 基线（MIMIC_III -7.7%, HumanActivity -1.2%, MIMIC_IV -0.8%），是目前效果最好的版本。

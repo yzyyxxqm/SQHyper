@@ -62,9 +62,7 @@ class QuaternionStructuredFusion(nn.Module):
     """
     def __init__(self, d_model):
         super().__init__()
-        assert d_model % 4 == 0
         self.d_model = d_model
-        q = d_model // 4  # sub-dimension for Kronecker blocks
 
         # Projections: each source → full D-dim
         self.proj_r = nn.Linear(3 * d_model, d_model)
@@ -75,11 +73,11 @@ class QuaternionStructuredFusion(nn.Module):
         nn.init.eye_(self.proj_j.weight)
         nn.init.eye_(self.proj_k.weight)
 
-        # Hamilton product weights: Kronecker block sub-matrices, each (D/4 × D/4)
-        self.Wr = nn.Parameter(torch.empty(q, q))
-        self.Wi = nn.Parameter(torch.empty(q, q))
-        self.Wj = nn.Parameter(torch.empty(q, q))
-        self.Wk = nn.Parameter(torch.empty(q, q))
+        # Hamilton product weights: Kronecker block sub-matrices, each (D × D)
+        self.Wr = nn.Parameter(torch.empty(d_model, d_model))
+        self.Wi = nn.Parameter(torch.empty(d_model, d_model))
+        self.Wj = nn.Parameter(torch.empty(d_model, d_model))
+        self.Wk = nn.Parameter(torch.empty(d_model, d_model))
         self.bias = nn.Parameter(torch.zeros(d_model))
         nn.init.eye_(self.Wr)
         nn.init.zeros_(self.Wi)
@@ -100,47 +98,26 @@ class QuaternionStructuredFusion(nn.Module):
         j = self.proj_j(tg)
         k = self.proj_k(vg)
 
-        # Interleave into quaternion order: [r0..r_{D/4-1}, i0..i_{D/4-1}, j0.., k0..]
-        # This is just cat(r, i, j, k) reshaped — the Kronecker block matrix
-        # naturally handles the (D/4, D/4) sub-blocks operating on each component.
-        q_in = torch.cat([r, i, j, k], dim=-1)  # (B, N, 4*(D/4)*4) = wait...
+        # Hamilton product via (4D × 4D) Kronecker block matrix
+        # Input: cat(r, i, j, k) ∈ R^(4D)
+        q_in = torch.cat([r, i, j, k], dim=-1)  # (B, N, 4D)
 
-        # Actually: r,i,j,k are each D-dim. We need to reshape them so that
-        # the Kronecker block matrix (D × D) can operate on them.
-        # 
-        # Standard approach: treat the D-dim vector as 4 groups of D/4.
-        # r → groups [r_0, r_1, r_2, r_3] each D/4-dim
-        # Then quaternion = (r_0, r_1, r_2, r_3) where r_0 is "real part" etc.
-        #
-        # But our semantic mapping is different: r is the real part, i/j/k are
-        # imaginary. So we concatenate as cat(r, i, j, k) ∈ R^(4D) and need
-        # a (4D × 4D) matrix... which is what we had before.
-        #
-        # The RIGHT way to get D-dim output with (D × D) Kronecker:
-        # Reshape each D-dim component into (D/4, 4), stack, apply per-group.
-        # Equivalently: interleave r,i,j,k at the feature level.
-
-        # Reshape: (B, N, D) → (B, N, D/4, 1) for each, then cat along last dim
-        q = D // 4
-        r_ = r.view(*r.shape[:-1], q, 1)  # (B, N, D/4, 1)
-        i_ = i.view(*i.shape[:-1], q, 1)
-        j_ = j.view(*j.shape[:-1], q, 1)
-        k_ = k.view(*k.shape[:-1], q, 1)
-        # Interleave: (B, N, D/4, 4) → (B, N, D)
-        q_in = torch.cat([r_, i_, j_, k_], dim=-1).reshape(*r.shape[:-1], D)
-
-        # Build Kronecker block matrix W ∈ R^(D × D) and apply
         Wr, Wi, Wj, Wk = self.Wr, self.Wi, self.Wj, self.Wk
         W = torch.cat([
             torch.cat([ Wr, -Wi, -Wj, -Wk], dim=1),
             torch.cat([ Wi,  Wr, -Wk,  Wj], dim=1),
             torch.cat([ Wj,  Wk,  Wr, -Wi], dim=1),
             torch.cat([ Wk, -Wj,  Wi,  Wr], dim=1),
-        ], dim=0)  # (D, D)
+        ], dim=0)  # (4D, 4D)
 
-        q_out = F.linear(q_in, W, self.bias)  # (B, N, D)
+        q_out = F.linear(q_in, W)  # (B, N, 4D)
 
-        # De-interleave: extract real part from each group of 4
+        # Extract real part (first D dims) as output
+        return q_out[..., :D] + self.bias
+
+
+# ============================================================================
+# Spike-Modulated Attention Temperature
         # q_out has interleaved [r0,i0,j0,k0, r1,i1,j1,k1, ...]
         # We want just the r-components: every 4th starting from 0
         # Reshape to (B, N, D/4, 4), take [:,:,:,0], reshape to (B, N, D/4)

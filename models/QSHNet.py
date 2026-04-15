@@ -365,12 +365,12 @@ class HypergraphLearner(nn.Module):
         self.d_model = d_model
         self.activation = nn.ReLU()
 
-        # === Node-to-Hyperedge: spike-modulated attention ===
+        # === Node-to-Hyperedge: standard attention (identical to HyperIMTS) ===
         self.node2temporal_hyperedge = nn.ModuleList([
-            SpikeModulatedAttentionBlock(d_model, 2*d_model, 2*d_model, d_model, n_heads)
+            MultiHeadAttentionBlock(d_model, 2*d_model, 2*d_model, d_model, n_heads)
             for _ in range(n_layers)])
         self.node2variable_hyperedge = nn.ModuleList([
-            SpikeModulatedAttentionBlock(d_model, 2*d_model, 2*d_model, d_model, n_heads)
+            MultiHeadAttentionBlock(d_model, 2*d_model, 2*d_model, d_model, n_heads)
             for _ in range(n_layers)])
 
         # === Node self-update (identical to HyperIMTS) ===
@@ -387,10 +387,6 @@ class HypergraphLearner(nn.Module):
         self.hyperedge2hyperedge_layers = [n_layers - 1]
         self.scale = 1 / time_length
         self.oom_flag = False
-
-        # === Spike Temperature: per-layer, computes attention temperature ===
-        self.spike_temp = nn.ModuleList([
-            SpikeTemperature(d_model) for _ in range(n_layers)])
 
     def get_fine_grained_embedding(self, tensor_flattened, target_shape):
         """Identical to HyperIMTS."""
@@ -415,30 +411,23 @@ class HypergraphLearner(nn.Module):
 
             md = repeat(x_y_mask_flattened, "B N -> B N D", D=D)
 
-            # === Spike Temperature: compute per-node attention temperature ===
-            temperature = self.spike_temp[i](
-                observation_nodes, variable_incidence_matrix, variable_indices_flattened)
-            # temperature: (B, N, 1) — used to modulate n2h attention
-
-            # === Node→Temporal Hyperedge (spike-modulated attention) ===
+            # === Node→Temporal Hyperedge (standard attention) ===
             temporal_hyperedges_updated = self.node2temporal_hyperedge[i](
                 temporal_hyperedges,
                 torch.cat([variable_hyperedges.gather(1, repeat(variable_indices_flattened, "B N -> B N D", D=D)),
                            observation_nodes], -1),
-                temporal_incidence_matrix if i != 0 else temporal_incidence_matrix * mask_temp,
-                temperature=temperature)
+                temporal_incidence_matrix if i != 0 else temporal_incidence_matrix * mask_temp)
 
             if i == 0:
                 mask_temp = 1 - repeat(y_mask_L_flattened, "B N -> B E N", E=variable_incidence_matrix.shape[1])
                 mask_temp[mask_temp == 0] = 1e-8
 
-            # === Node→Variable Hyperedge (spike-modulated attention) ===
+            # === Node→Variable Hyperedge (standard attention) ===
             variable_hyperedges_updated = self.node2variable_hyperedge[i](
                 variable_hyperedges,
                 torch.cat([temporal_hyperedges.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D)),
                            observation_nodes], -1),
-                variable_incidence_matrix if i != 0 else variable_incidence_matrix * mask_temp,
-                temperature=temperature)
+                variable_incidence_matrix if i != 0 else variable_incidence_matrix * mask_temp)
 
             variable_hyperedges = variable_hyperedges_updated
             temporal_hyperedges = temporal_hyperedges_updated

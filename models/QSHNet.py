@@ -102,13 +102,12 @@ class SpikeRouter(nn.Module):
         self.threshold = nn.Parameter(torch.tensor(0.0))
         self.gamma = nn.Parameter(torch.tensor(5.0))
         self.retain_log_scale = nn.Parameter(torch.tensor(0.0))
-        self.event_log_scale = nn.Parameter(torch.tensor(-8.0))
+        self.event_log_scale = nn.Parameter(torch.tensor(-4.5))
+        self.retain_strength_max = 0.1
 
     def compute_retain_strength(self):
-        return torch.clamp(2.0 * torch.sigmoid(self.retain_log_scale) - 1.0, min=0.0, max=1.0)
-
-    def compute_event_strength(self):
-        return torch.sigmoid(self.event_log_scale)
+        bounded_strength = 2.0 * torch.sigmoid(self.retain_log_scale) - 1.0
+        return self.retain_strength_max * torch.clamp(bounded_strength, min=0.0, max=1.0)
 
     def forward(self, obs, mask_d, variable_incidence_matrix, variable_indices_flattened):
         """
@@ -131,7 +130,7 @@ class SpikeRouter(nn.Module):
         route_logit = membrane
         retain_strength = self.compute_retain_strength()
         retain_gate = 1.0 - retain_strength * torch.sigmoid(-route_logit)
-        event_gate = self.compute_event_strength() * torch.sigmoid(route_logit)
+        event_gate = torch.exp(self.event_log_scale) * torch.sigmoid(route_logit)
         event_features = self.event_proj(torch.cat([obs, deviation], dim=-1))
         obs_base = obs * retain_gate.unsqueeze(-1) * mask_d
         obs_event = event_features * event_gate.unsqueeze(-1) * mask_d
@@ -295,8 +294,14 @@ class HypergraphLearner(nn.Module):
         # === QSH-Net Enhancement 1: Spike Selection (per layer) ===
         self.spike_select = nn.ModuleList([
             SpikeRouter(d_model) for _ in range(n_layers)])
+        initial_event_scale = math.log(0.1 / 0.9)
         self.event_residual_scale = nn.ParameterList([
-            nn.Parameter(torch.tensor(0.0)) for _ in range(n_layers)])
+            nn.Parameter(torch.tensor(initial_event_scale)) for _ in range(n_layers)])
+        self.event_scale_max = 0.12
+        self.temporal_event_norm = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(n_layers)])
+        self.variable_event_norm = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(n_layers)])
 
         # === QSH-Net Enhancement 2: Quaternion Refinement (per layer) ===
         # QuaternionLinear refines linear output via Hamilton product cross-coupling
@@ -305,6 +310,7 @@ class HypergraphLearner(nn.Module):
             QuaternionLinear(d_model, d_model) for _ in range(n_layers)])
         self.quat_gate = nn.ModuleList([
             nn.Linear(d_model + 1, 1) for _ in range(n_layers)])
+        self.quat_residual_ratio_max = 0.25
         for gate in self.quat_gate:
             nn.init.zeros_(gate.weight)
             nn.init.constant_(gate.bias, -3.0)
@@ -320,12 +326,35 @@ class HypergraphLearner(nn.Module):
         result.masked_scatter_(mask, tf)
         return rearrange(result, "B L E D -> B E (L D)")
 
-    def compute_event_scale(self, layer_idx):
-        return torch.sigmoid(self.event_residual_scale[layer_idx] - 8.0)
-
     def compute_quaternion_gate(self, layer_idx, linear_out, event_gate):
         gate_input = torch.cat([linear_out, event_gate.unsqueeze(-1)], dim=-1)
         return torch.sigmoid(self.quat_gate[layer_idx](gate_input))
+
+    def bound_quaternion_residual(self, linear_out, quat_out, alpha):
+        residual = alpha * quat_out
+        linear_norm = linear_out.norm(dim=-1, keepdim=True)
+        residual_norm = residual.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        max_residual_norm = self.quat_residual_ratio_max * linear_norm
+        residual_scale = torch.clamp(max_residual_norm / residual_norm, max=1.0)
+        return residual * residual_scale
+
+    def normalize_event_delta(self, layer_idx, event_delta, target):
+        if target == "temporal":
+            return self.temporal_event_norm[layer_idx](event_delta)
+        if target == "variable":
+            return self.variable_event_norm[layer_idx](event_delta)
+        raise ValueError(f"Unknown event target: {target}")
+
+    def compute_event_scale(self, layer_idx):
+        return torch.clamp(
+            torch.sigmoid(self.event_residual_scale[layer_idx]),
+            max=self.event_scale_max,
+        )
+
+    def apply_event_injection(self, layer_idx, main_state, event_delta, event_scale, target):
+        if target not in {"temporal", "variable"}:
+            raise ValueError(f"Unknown event target: {target}")
+        return main_state + event_scale * event_delta
 
     def forward(self, observation_nodes, temporal_hyperedges, variable_hyperedges,
                 time_indices_flattened, variable_indices_flattened,
@@ -347,6 +376,8 @@ class HypergraphLearner(nn.Module):
             event_scale = self.compute_event_scale(i)
             temporal_event_delta = (temporal_incidence_matrix @ obs_event) / temporal_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
             variable_event_delta = (variable_incidence_matrix @ obs_event) / variable_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
+            temporal_event_delta = self.normalize_event_delta(i, temporal_event_delta, target="temporal")
+            variable_event_delta = self.normalize_event_delta(i, variable_event_delta, target="variable")
 
             # Node→temporal hyperedge (using spike-selected nodes)
             temporal_hyperedges_updated = self.node2temporal_hyperedge[i](
@@ -354,7 +385,13 @@ class HypergraphLearner(nn.Module):
                 torch.cat([variable_hyperedges.gather(1, repeat(variable_indices_flattened, "B N -> B N D", D=D)),
                            obs_base], -1),
                 temporal_incidence_matrix if i != 0 else temporal_incidence_matrix * mask_temp)
-            temporal_hyperedges_updated = temporal_hyperedges_updated + event_scale * temporal_event_delta
+            temporal_hyperedges_updated = self.apply_event_injection(
+                layer_idx=i,
+                main_state=temporal_hyperedges_updated,
+                event_delta=temporal_event_delta,
+                event_scale=event_scale,
+                target="temporal",
+            )
 
             if i == 0:
                 mask_temp = 1 - repeat(y_mask_L_flattened, "B N -> B E N", E=variable_incidence_matrix.shape[1])
@@ -366,7 +403,13 @@ class HypergraphLearner(nn.Module):
                 torch.cat([temporal_hyperedges.gather(1, repeat(time_indices_flattened, "B N -> B N D", D=D)),
                            obs_base], -1),
                 variable_incidence_matrix if i != 0 else variable_incidence_matrix * mask_temp)
-            variable_hyperedges_updated = variable_hyperedges_updated + event_scale * variable_event_delta
+            variable_hyperedges_updated = self.apply_event_injection(
+                layer_idx=i,
+                main_state=variable_hyperedges_updated,
+                event_delta=variable_event_delta,
+                event_scale=event_scale,
+                target="variable",
+            )
 
             variable_hyperedges = variable_hyperedges_updated
             temporal_hyperedges = temporal_hyperedges_updated
@@ -398,7 +441,8 @@ class HypergraphLearner(nn.Module):
             quat_out = self.quat_h2n[i](linear_out)
             # Additive refinement with learnable gate (starts near 0 → pure HyperIMTS)
             alpha = self.compute_quaternion_gate(i, linear_out, route_state["event_gate"])
-            h2n_out = linear_out + alpha * quat_out
+            quat_residual = self.bound_quaternion_residual(linear_out, quat_out, alpha)
+            h2n_out = linear_out + quat_residual
             # Diagnostic logging
             if not hasattr(self, '_h2n_count'):
                 self._h2n_count = 0
@@ -406,7 +450,8 @@ class HypergraphLearner(nn.Module):
             if self._h2n_count % 200 == 1:
                 logger.info(f"[Quat L{i}] alpha={alpha.mean().item():.4f} event={route_state['event_gate'].mean().item():.5f} "
                             f"|linear|={linear_out.norm().item():.2f} "
-                            f"|quat|={quat_out.norm().item():.2f}")
+                            f"|quat|={quat_out.norm().item():.2f} "
+                            f"|quat_res|={quat_residual.norm().item():.2f}")
 
             observation_nodes = self.activation((observation_nodes + h2n_out) * md)
 

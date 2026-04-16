@@ -8,7 +8,7 @@ from utils.configs import get_configs
 
 class TestQSHNet(unittest.TestCase):
 
-    def test_spike_router_starts_as_identity_with_silent_event_path(self):
+    def test_spike_router_starts_as_identity_with_moderate_event_gate(self):
         router = SpikeRouter(d_model=8)
         obs = torch.randn(2, 3, 8)
         mask_d = torch.ones_like(obs)
@@ -31,7 +31,8 @@ class TestQSHNet(unittest.TestCase):
         self.assertTrue(torch.allclose(obs_base, obs, atol=1e-6))
         self.assertTrue(torch.allclose(obs_event, torch.zeros_like(obs), atol=1e-6))
         self.assertGreater(route_state["retain_gate"].min().item(), 0.99)
-        self.assertLess(route_state["event_gate"].max().item(), 0.01)
+        self.assertGreater(route_state["event_gate"].mean().item(), 0.001)
+        self.assertLess(route_state["event_gate"].mean().item(), 0.01)
 
     def test_hypergraph_learner_uses_nodewise_conditioned_quaternion_gate(self):
         learner = HypergraphLearner(n_layers=1, d_model=8, n_heads=1, time_length=4)
@@ -45,10 +46,77 @@ class TestQSHNet(unittest.TestCase):
         self.assertTrue(torch.all(quat_gate <= 1.0))
         self.assertLess(quat_gate.mean().item(), 0.1)
 
-    def test_spike_router_keeps_retain_gate_bounded_when_scale_grows(self):
-        router = SpikeRouter(d_model=8)
-        router.retain_log_scale.data.fill_(5.0)
+    def test_quaternion_residual_is_bounded_relative_to_linear_path(self):
+        learner = HypergraphLearner(n_layers=1, d_model=8, n_heads=1, time_length=4)
+        linear_out = torch.ones(2, 3, 8)
+        quat_out = torch.full((2, 3, 8), 20.0)
+        alpha = torch.ones(2, 3, 1)
 
+        bounded_residual = learner.bound_quaternion_residual(
+            linear_out=linear_out,
+            quat_out=quat_out,
+            alpha=alpha,
+        )
+
+        residual_norm = bounded_residual.norm(dim=-1)
+        linear_norm = linear_out.norm(dim=-1)
+
+        self.assertTrue(torch.all(residual_norm <= 0.25 * linear_norm + 1e-6))
+
+    def test_event_delta_normalization_centers_each_hyperedge_feature_vector(self):
+        learner = HypergraphLearner(n_layers=1, d_model=8, n_heads=1, time_length=4)
+        event_delta = torch.randn(2, 3, 8) * 5.0 + 7.0
+
+        normalized_delta = learner.normalize_event_delta(0, event_delta, target="temporal")
+
+        self.assertEqual(normalized_delta.shape, torch.Size((2, 3, 8)))
+        self.assertTrue(
+            torch.allclose(
+                normalized_delta.mean(dim=-1),
+                torch.zeros(2, 3),
+                atol=1e-5,
+            )
+        )
+
+    def test_event_injection_adds_bounded_delta_to_both_hyperedge_paths(self):
+        learner = HypergraphLearner(n_layers=1, d_model=8, n_heads=1, time_length=4)
+        event_delta = torch.full((2, 3, 8), 0.5)
+        main_state = torch.randn(2, 3, 8)
+        event_scale = torch.tensor(0.1)
+
+        temporal_injected = learner.apply_event_injection(
+            layer_idx=0,
+            main_state=main_state,
+            event_delta=event_delta,
+            event_scale=event_scale,
+            target="temporal",
+        )
+        variable_injected = learner.apply_event_injection(
+            layer_idx=0,
+            main_state=main_state,
+            event_delta=event_delta,
+            event_scale=event_scale,
+            target="variable",
+        )
+
+        expected = main_state + 0.05
+        self.assertTrue(torch.allclose(temporal_injected, expected, atol=1e-6))
+        self.assertTrue(torch.allclose(variable_injected, expected, atol=1e-6))
+
+    def test_event_scale_is_capped_without_disturbing_small_initial_value(self):
+        learner = HypergraphLearner(n_layers=1, d_model=8, n_heads=1, time_length=4)
+
+        initial_scale = learner.compute_event_scale(0).item()
+        with torch.no_grad():
+            learner.event_residual_scale[0].fill_(10.0)
+        capped_scale = learner.compute_event_scale(0).item()
+
+        self.assertGreater(initial_scale, 0.05)
+        self.assertLess(initial_scale, 0.12)
+        self.assertLessEqual(capped_scale, 0.12 + 1e-6)
+
+    def test_spike_router_caps_retain_gate_drop_under_large_scale(self):
+        router = SpikeRouter(d_model=8)
         obs = torch.randn(2, 3, 8)
         mask_d = torch.ones_like(obs)
         variable_incidence_matrix = torch.tensor([
@@ -60,21 +128,29 @@ class TestQSHNet(unittest.TestCase):
             [0, 1, 0],
         ])
 
+        with torch.no_grad():
+            router.membrane_proj.weight.zero_()
+            router.membrane_proj.bias.fill_(-10.0)
+            router.retain_log_scale.fill_(5.0)
+
         _, _, route_state = router(
             obs, mask_d, variable_incidence_matrix, variable_indices_flattened
         )
 
-        self.assertTrue(torch.all(route_state["retain_gate"] >= 0.0))
-        self.assertTrue(torch.all(route_state["retain_gate"] <= 1.0))
+        self.assertGreaterEqual(route_state["retain_gate"].min().item(), 0.9)
+        self.assertLessEqual(route_state["retain_gate"].max().item(), 1.0)
 
-    def test_hypergraph_learner_event_residual_scale_is_bounded(self):
-        learner = HypergraphLearner(n_layers=1, d_model=8, n_heads=1, time_length=4)
-        learner.event_residual_scale[0].data.fill_(5.0)
+    def test_hypergraph_learner_initializes_event_residual_with_small_nonzero_scale(self):
+        learner = HypergraphLearner(n_layers=2, d_model=8, n_heads=1, time_length=4)
 
-        event_scale = learner.compute_event_scale(0)
+        event_scales = [
+            torch.sigmoid(scale.detach()).item()
+            for scale in learner.event_residual_scale
+        ]
 
-        self.assertGreaterEqual(event_scale.item(), 0.0)
-        self.assertLessEqual(event_scale.item(), 1.0)
+        for event_scale in event_scales:
+            self.assertGreater(event_scale, 0.05)
+            self.assertLess(event_scale, 0.15)
 
     def test_model_forward_runs_with_default_configs(self):
         configs = get_configs(args=["--model_name", "QSHNet", "--model_id", "QSHNet"])

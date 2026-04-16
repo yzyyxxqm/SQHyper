@@ -111,6 +111,36 @@ class Exp_Main(Exp_Basic):
         criterion = loss_module.Loss(self.configs)
         return criterion
 
+    def _log_qsh_diagnostics(self, model_train: Module, epoch: int, train_stage: int) -> None:
+        if 'QSH' not in self.configs.model_name or not accelerator.is_main_process:
+            return
+
+        model_ref = accelerator.unwrap_model(model_train)
+        learner = getattr(model_ref, 'hypergraph_learner', None)
+        if learner is None:
+            return
+
+        parts = []
+        for layer_idx, router in enumerate(learner.spike_select):
+            parts.append(
+                "L{} retain_log_scale={:.4f} event_log_scale={:.4f} event_residual_scale={:.4f} membrane_w_norm={:.4f} event_proj_w_norm={:.4f} quat_gate_bias={:.4f} quat_gate_w_norm={:.4f} quat_r_norm={:.4f} quat_i_norm={:.4f} quat_j_norm={:.4f} quat_k_norm={:.4f}".format(
+                    layer_idx,
+                    router.retain_log_scale.detach().item(),
+                    router.event_log_scale.detach().item(),
+                    learner.event_residual_scale[layer_idx].detach().item(),
+                    router.membrane_proj.weight.detach().norm().item(),
+                    router.event_proj.weight.detach().norm().item(),
+                    learner.quat_gate[layer_idx].bias.detach().mean().item(),
+                    learner.quat_gate[layer_idx].weight.detach().norm().item(),
+                    learner.quat_h2n[layer_idx].r.detach().norm().item(),
+                    learner.quat_h2n[layer_idx].i.detach().norm().item(),
+                    learner.quat_h2n[layer_idx].j.detach().norm().item(),
+                    learner.quat_h2n[layer_idx].k.detach().norm().item(),
+                )
+            )
+
+        logger.info(f"[QSHDiag][stage={train_stage}][epoch={epoch}] " + " | ".join(parts))
+
     def _get_state_dict(self, path: Path) -> OrderedDict:
         '''
         Fix model state dict errors
@@ -355,6 +385,7 @@ class Exp_Main(Exp_Basic):
                         "loss_train": np.mean(train_loss),
                     })
 
+                self._log_qsh_diagnostics(model_train, epoch, train_stage)
                 lr_scheduler.step()
                 logger.debug(f'Updating learning rate to {lr_scheduler.get_last_lr()[0]:.6e}')
                 if accelerator.check_trigger():

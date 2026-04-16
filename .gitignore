@@ -1,4 +1,5 @@
 notes.md
+.worktrees/
 .vscode/
 .idea/
 *.pyc

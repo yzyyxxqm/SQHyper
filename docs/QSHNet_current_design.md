@@ -1,32 +1,33 @@
 # QSH-Net 当前实现设计文档
 
-> **最后更新：** 2026-04-12
-> **状态：** 已验证，USHCN 和 HumanActivity 均优于 HyperIMTS 基线
+> **最后更新：** 2026-04-15
+> **状态：** M1 分层协同实现已完成并完成多数据集实验；结构方向成立，当前需优先稳定化
 
 ---
 
 ## 1. 总体架构
 
-QSH-Net（Quaternion-Spiking-Hypergraph Network）是一个面向不规则多元时间序列（IMTS）预测的模型。它以 HyperIMTS 的超图消息传递框架为**不变核心**，在消息传递的关键阶段有机融合了脉冲神经元事件检测和四元数 Hamilton 积特征精炼。
+QSH-Net（Quaternion-Spiking-Hypergraph Network）是一个面向不规则多元时间序列（IMTS）预测的模型。当前实现采用方案 B 的 **M1 分层协同版本**：保留 HyperIMTS 的超图消息传递框架作为稳定骨架，在消息传递内部引入连续 Spike 路由和条件化 Quaternion 融合。
 
-### 1.1 核心设计原则：恒等初始化
+### 1.1 核心设计原则：安全初始化
 
-QSH-Net 的所有增强组件（Spike、Quaternion）在初始化时都精确等价于恒等映射。这意味着：
+当前实现不再追求所有增强分支都“严格精确恒等”，而是追求**尽可能接近主干、且不会在训练初期大幅污染主路径**。这意味着：
 
-- **训练起点 = 纯 HyperIMTS**：模型从已验证有效的基线开始，不会因为新组件的随机初始化引入噪声
-- **安全退化**：如果 Spike/Quaternion 无法学到有用的东西，它们保持近恒等，不伤害性能
-- **渐进学习**：新组件只在训练证明其有益时才逐渐偏离恒等
+- **Spike 主路径精确保真：** `retain_gate` 初始为 1，`obs_base = obs`
+- **事件支路初始静默：** `event_proj` 全零初始化，`event_residual_scale = 0`，所以 `obs_event` 与事件残差初始不影响主干
+- **Quaternion 弱残差启动：** 条件化 gate 初始化在 `sigmoid(-3) ≈ 0.047` 附近，四元数残差以很弱强度参与，而不是从随机强干预开始
+- **渐进学习：** 只有当训练证明这些增强有益时，路由与条件化融合才会偏离初始安全状态
 
 ### 1.2 信号处理流水线
 
 ```
-obs → [Spike Selection] → [Hypergraph Message Passing] → [Quaternion Refinement] → prediction
-         ↑ 用 H 的变量关联矩阵          (不变核心)            ↑ 精炼 H 的融合结果
+obs → [Spike Router: base / event split] → [Hypergraph Message Passing + event residual] → [Quaternion-conditioned fusion] → prediction
+         ↑ 用 H 的变量关联矩阵                     (不变骨架)                            ↑ 用 event_gate 调节四元数残差
 ```
 
 模型由三个主要部分组成：
 1. **HypergraphEncoder**：将 IMTS 数据转化为超图表示（观测节点 + 时间超边 + 变量超边）
-2. **HypergraphLearner**：在超图上进行多层消息传递，每层融合脉冲选择（前置）和四元数精炼（后置）
+2. **HypergraphLearner**：在超图上进行多层消息传递，每层执行连续 Spike 路由、事件增强残差和条件化四元数融合
 3. **Decoder**：将更新后的节点和超边特征映射为预测值
 
 ---
@@ -112,11 +113,16 @@ variable_hyperedges = ReLU(learnable_weights)  # (B, ENC_IN, d_model)
 
 超图学习器执行 n_layers 层消息传递。每层包含以下步骤：
 
-### 4.1 步骤一：上下文感知脉冲选择（QSH-Net 增强 1）
+### 4.1 步骤一：连续 Spike 路由（QSH-Net 增强 1）
 
 **位置：** node-to-hyperedge 消息传递**之前**
 
-**目的：** 利用超图的变量关联矩阵计算每个变量的聚合上下文，判断每个观测是否"偏离"其变量的典型模式。偏离较大的观测被视为"事件"（fire），全信号参与后续消息传递；其他观测被轻微衰减。
+**目的：** 利用超图的变量关联矩阵计算每个变量的聚合上下文，将每个观测拆成两条路径：
+
+- **`obs_base`：** 走稳定主干的基础路径
+- **`obs_event`：** 只在需要时参与事件增强流的事件路径
+
+当前实现采用**连续 gate**，不再用硬二值 fire 直接控制主路径。
 
 **数学公式：**
 ```
@@ -125,56 +131,69 @@ var_count = variable_incidence_matrix.sum(dim=-1, keepdim=True).clamp(min=1)  # 
 var_context = (variable_incidence_matrix @ obs) / var_count                    # (B, E, D)
 obs_var_ctx = var_context.gather(1, variable_indices_expanded)                 # (B, N, D)
 
-# 2. 计算偏差并生成膜电位
-deviation = obs - obs_var_ctx                                     # 观测与变量上下文的偏差
-membrane = Linear(2D, 1)(cat(obs, deviation)).squeeze(-1)         # 标量膜电位 (B, N)
+# 2. 计算偏差并生成路由分数
+deviation = obs - obs_var_ctx
+route_logit = Linear(2D, 1)(cat(obs, deviation)).squeeze(-1)      # (B, N)
 
-# 3. 脉冲发放
-spike = Heaviside(membrane - threshold)                           # {0, 1}
+# 3. 连续 gate
+retain_gate = 1 - (exp(retain_log_scale) - 1) * sigmoid(-route_logit)
+event_gate = exp(event_log_scale) * sigmoid(route_logit)
 
-# 4. 加权输出
-attenuation = sigmoid(log_attenuation)                            # 衰减因子 ∈ (0, 1)
-weight = spike + (1 - spike) * attenuation                        # firing→1, non-firing→attn
-obs_selected = obs * weight.unsqueeze(-1) * mask
+# 4. 输出两条路径
+event_features = Linear(2D, D)(cat(obs, deviation))
+obs_base = obs * retain_gate.unsqueeze(-1) * mask
+obs_event = event_features * event_gate.unsqueeze(-1) * mask
 ```
 
-**恒等初始化策略：**
+**安全初始化策略：**
 
 | 参数 | 初始值 | 效果 |
 |------|--------|------|
-| `membrane_proj.weight` | **全零** | membrane = 0 对所有观测 |
-| `membrane_proj.bias` | **全零** | membrane = 0 对所有观测 |
-| `threshold` | 0.0 | `0 >= 0` = True → 所有观测 fire |
-| `log_attenuation` | 4.0 | `sigmoid(4) ≈ 0.982` 非 fire 时信号保留 98.2% |
-| `gamma` | 5.0 | 替代梯度斜率 |
+| `membrane_proj.weight/bias` | **全零** | `route_logit = 0` |
+| `retain_log_scale` | 0.0 | `retain_gate = 1` → 主路径精确保真 |
+| `event_proj.weight/bias` | **全零** | 事件特征初始为 0 |
+| `event_log_scale` | -8.0 | `event_gate ≈ 1.7e-4`，且乘上全零事件特征后输出仍为 0 |
+| `threshold` / `gamma` | 0.0 / 5.0 | 当前主路径未直接使用，保留作诊断与后续脉冲语义扩展 |
 
-初始化后的行为：所有 membrane = 0，threshold = 0，`0 >= 0 = True`，所有观测 fire，weight = 1 → **精确恒等映射**。
+初始化后的行为：`obs_base = obs`，`obs_event = 0`，因此 SpikeRouter 在训练开始时近似等价于纯主干前处理。
 
-**反向传播：** Heaviside 函数不可导，使用 sigmoid 导数作为替代梯度（surrogate gradient）。
+**与超图的有机连接：** 路由分数依赖超图的变量关联矩阵来计算每个变量的上下文。也就是说，事件判断不是外部启发式，而是建立在超图结构之上。
 
-**与超图的有机连接：** 脉冲决策**依赖超图的变量关联矩阵**来计算每个变量的上下文。这不是一个独立的筛选模块——它利用了超图的结构信息来判断什么是"事件"。
+**参数量：** 每层 SpikeRouter 额外参数约为 `2D² + 3D + 5`。当 `d_model=256` 时约为 **131,845** 个参数，主要增长来自 `event_proj(2D→D)`。
 
-**参数量：** 每层 `Linear(2D, 1)` = 2D+1 个参数，加上 threshold/gamma/log_attenuation 各 1 个 = **2D + 4 个参数**（d_model=256 时仅 516 个参数）。
+### 4.2 步骤二：Node-to-Hyperedge 消息传递 + 事件增强残差
 
-### 4.2 步骤二：Node-to-Hyperedge 消息传递
-
-使用 spike-selected 的节点特征进行聚合。与 HyperIMTS 一致，但输入是经过脉冲选择的节点。
+普通 node-to-hyperedge 聚合仍沿用 HyperIMTS 的 attention 主干，但输入从单一路径变为 `obs_base`，同时为 temporal / variable hyperedge 各自添加一条事件增强残差。
 
 **Node→Temporal Hyperedge：**
 ```
-Q = temporal_hyperedges                              # (B, L, D)
-KV = cat(variable_HE_gathered, obs_selected)         # (B, N, 2D) — 交叉信息注入
-mask = temporal_incidence_matrix                      # (B, L, N)
-temporal_HE_updated = MultiHeadAttention(Q, KV, mask)
+temporal_HE_base = MultiHeadAttention(
+    Q=temporal_hyperedges,
+    KV=cat(variable_HE_gathered, obs_base),
+    mask=temporal_incidence_matrix
+)
+
+temporal_event_delta = (temporal_incidence_matrix @ obs_event) / temporal_count
+temporal_HE_updated = temporal_HE_base + event_scale * temporal_event_delta
 ```
 
 **Node→Variable Hyperedge：**
 ```
-Q = variable_hyperedges                              # (B, ENC_IN, D)
-KV = cat(temporal_HE_gathered, obs_selected)         # (B, N, 2D) — 交叉信息注入
-mask = variable_incidence_matrix                      # (B, ENC_IN, N)
-variable_HE_updated = MultiHeadAttention(Q, KV, mask)
+variable_HE_base = MultiHeadAttention(
+    Q=variable_hyperedges,
+    KV=cat(temporal_HE_gathered, obs_base),
+    mask=variable_incidence_matrix
+)
+
+variable_event_delta = (variable_incidence_matrix @ obs_event) / variable_count
+variable_HE_updated = variable_HE_base + event_scale * variable_event_delta
 ```
+
+其中：
+
+- `event_scale = exp(event_residual_scale) - 1`
+- `event_residual_scale` 初始化为 0，因此 `event_scale = 0`
+- 在初始化时，事件残差对超边更新**没有任何影响**
 
 **第一层特殊处理：** 在第一层中，预测目标位置的节点被从关联矩阵中屏蔽（mask_temp），防止未知的预测目标影响超边的初始聚合。
 
@@ -205,42 +224,44 @@ h2n_input = cat(obs, tg, vg)                         # (B, N, 3D)
 
 node_self_update 需要 O(N²) 内存，在大 N 时（如 P12 有 36 变量）会触发 CUDA OOM，自动降级为 fallback 路径。
 
-### 4.4 步骤四：四元数精炼（QSH-Net 增强 2）
+### 4.4 步骤四：条件化四元数融合（QSH-Net 增强 2）
 
 **位置：** hyperedge-to-node 融合层
 
-**目的：** 用 Hamilton 积捕获标准线性层无法表达的跨特征组交互（cross-feature-group interactions）。
+**目的：** 用 Hamilton 积捕获标准线性层难以表达的跨特征组交互，并通过 `event_gate` 让四元数残差根据节点状态与事件性进行条件化参与。
 
-当前设计为**对线性路径输出的残差精炼**：
+当前设计为**线性主路径 + 条件化四元数残差**：
 
 ```
 # HyperIMTS 原始路径（不变）
 linear_out = Linear(3D, D)(h2n_input)                # (B, N, D)
 
-# 四元数精炼：Hamilton 积捕获 linear_out 内部的跨特征组交互
+# 四元数残差
 quat_out = QuaternionLinear(D, D)(linear_out)        # (B, N, D)
 
-# 加法精炼（非插值融合）
-alpha = sigmoid(gate)                                 # gate 初始化为 -3.0 → alpha ≈ 0.047
-h2n_out = linear_out + alpha * quat_out
+# 条件化 gate
+quat_gate = sigmoid(Linear(D+1, 1)(cat(linear_out, event_gate)))
+h2n_out = linear_out + quat_gate * quat_out
 ```
 
-**关键：加法精炼 vs 插值融合**
+**初始化策略：**
 
-旧版使用插值：`h2n_out = (1-α) * linear + α * quat`——quaternion 在**替代**部分 linear 输出。
-当前使用加法：`h2n_out = linear + α * quat`——quaternion 在**补充** linear 输出。
+- `QuaternionLinear` 仍采用恒等初始化：`W_r = I`，`W_i = W_j = W_k = 0`
+- 条件 gate 的权重初始化为 0，bias 初始化为 -3.0
+- 因此 `quat_gate ≈ 0.047`，四元数残差以较弱强度参与
 
-**QuaternionLinear 恒等初始化：**
+**与旧版差异：**
 
-初始化为 `W_r = I`（单位矩阵），`W_i = W_j = W_k = 0`，此时 W 退化为块对角单位矩阵 → `QuaternionLinear(x) = x`。
+- 旧版 gate 是全局单标量，所有节点共享同一 `alpha`
+- 当前 gate 是节点级条件化标量，输入依赖 `linear_out` 和 `event_gate`
+- 这意味着四元数分支不再是全局统一强度，而是按节点自适应启用
 
-**Gate 参数：**
+**当前实现的现实含义：**
 
-| 参数 | 初始值 | sigmoid 值 | 含义 |
-|------|--------|-----------|------|
-| `gate` | -3.0 | 0.047 | 四元数精炼的初始影响 ≈ 4.7% |
+- h2n 融合端不是严格等于旧版主干，而是从一个**弱四元数残差**状态启动
+- 当前实验结果表明，这样的条件化设计方向可行，但在部分 seed 上仍存在偶发失稳问题
 
-**参数量：** 每层 `QuaternionLinear(D, D)` = 4 × (D/4)² + D = D²/4 + D 个参数 + 1 个 gate。d_model=256 时每层约 **16,641 个参数**。
+**参数量：** 每层条件化四元数部分额外参数约为 `D²/4 + 2D + 3`（含 `event_residual_scale` 与条件 gate）。当 `d_model=256` 时约为 **16,899** 个参数。
 
 **节点更新：**
 ```
@@ -298,36 +319,38 @@ QSH-Net 使用 **AdamW**（而非 Adam），添加 weight_decay = 1e-4 进行 L2
 
 | 组件 | HyperIMTS | QSH-Net | 位置 |
 |------|-----------|---------|------|
-| n2h 前处理 | 无 | **上下文脉冲选择** | 每层消息传递开始 |
-| h2n 融合 | `Linear(3D, D)` | `Linear(3D, D) + α·QuatLinear(D,D)` | 每层 HE-to-node |
+| n2h 前处理 | 无 | **SpikeRouter：`obs_base / obs_event / route_state`** | 每层消息传递开始 |
+| 超边更新 | 纯 attention 聚合 | **attention 主路径 + 事件增强残差** | 每层 temporal / variable 更新 |
+| h2n 融合 | `Linear(3D, D)` | `Linear(3D, D) + quat_gate(node,event)·QuatLinear(D,D)` | 每层 HE-to-node |
 | 优化器 | Adam | **AdamW** (weight_decay=1e-4) | 训练循环 |
 | 其他所有组件 | — | **完全一致** | — |
 
 ### 7.2 额外参数量
 
-| d_model | 每层 Spike | 每层 Quaternion | 每层总计 | 相对于 HyperIMTS |
-|---------|-----------|----------------|---------|-----------------|
-| 128 | 260 | 4,225 | **4,486** | +1.7% |
-| 256 | 516 | 16,641 | **17,158** | +1.6% |
+| d_model | 每层 SpikeRouter | 每层 Event/CondQuat | 每层额外总计 |
+|---------|------------------|---------------------|----------------|
+| 128 | 33,157 | 4,355 | **37,512** |
+| 256 | 131,845 | 16,899 | **148,744** |
+
+M1 不再是早期“轻量插件版” QSH-Net。当前参数增长的主要来源是 `event_proj(2D→D)`，这是为了给事件增强流提供足够表达力而引入的结构性代价。
 
 ---
 
-## 8. 实验结果（2026-04-15 全数据集最终版）
+## 8. 实验结果（2026-04-15，M1 当前实现）
 
-| 数据集 | HyperIMTS (论文, itr=5) | **QSH-Net** | 改善 vs HyperIMTS |
-|--------|------------------------|-------------|-------------------|
-| **MIMIC_III** (itr=5) | 0.4259 ± 0.0021 | **0.3933 ± 0.0060** | **-7.7%** ✅ |
-| **MIMIC_IV** (itr=4) | 0.2174 ± 0.0009 | **0.2157 ± 0.0022** | **-0.8%** ✅ |
-| **HumanActivity** (itr=5) | 0.0421 ± 0.0021 | **0.0416 ± 0.0003** | **-1.2%** ✅ |
-| P12 (itr=5) | 0.2996 ± 0.0003 | 0.3006 ± 0.0013 | +0.3% ⚠ |
-| USHCN (itr=5) | 0.1738 ± 0.0078 | 0.1870 ± 0.0277 | +7.6% ❌ |
+| 数据集 | 论文 HyperIMTS | 当前 M1 结果 | 结论 |
+|--------|----------------|--------------|------|
+| USHCN (10 轮) | 0.1738 ± 0.0078 | **0.1846 ± 0.0323** | 均值略优于旧版 QSH，但双峰与异常轮仍在 |
+| HumanActivity (5 轮) | 0.0421 ± 0.0021 | **0.0416 ± 0.0002** | 基本持平，安全退化成立 |
+| P12 (5 轮) | 0.2996 ± 0.0003 | 0.3012 ± 0.0012 | 略有退步，但幅度较小 |
+| MIMIC_III (5 轮) | 0.4259 ± 0.0021 | **0.4047 ± 0.0300** | 仍优于论文基线，但较旧版 QSH 的均值和稳定性退步 |
+| MIMIC_IV | 0.2174 ± 0.0009 | 未运行 | 因训练成本高，暂未评估 |
 
-各轮详情：
-- MIMIC_III: 0.388, 0.389, 0.402, 0.400, 0.388
-- MIMIC_IV: 0.2155, 0.2140, 0.2190, 0.2145
-- HumanActivity: 0.0413, 0.0419, 0.0413, 0.0415, 0.0417
-- P12: 0.3009, 0.2998, 0.3027, 0.3001, 0.2996
-- USHCN: 0.1696, 0.1687, 0.2361(异常), 0.1617, 0.1991
+当前实现的整体判断如下：
+
+- **结构方向成立。** M1 证明了分层协同设计可以安全接入 HyperIMTS 主干。
+- **当前主要问题是偶发失稳。** USHCN 和 MIMIC_III 都保留了好轮次，但在部分 seed 上会出现明显坏轮。
+- **M1 适合作为当前保留版本。** 这版不应回退，但下一阶段目标应是稳定化，而不是立刻扩展 M2。
 
 ---
 
@@ -336,15 +359,17 @@ QSH-Net 使用 **AdamW**（而非 Adam），添加 weight_decay = 1e-4 进行 L2
 ```
 models/QSHNet.py           # 模型全部实现
 ├── QuaternionLinear       # 四元数线性层（Hamilton 积 Kronecker 块矩阵），恒等初始化
-├── SpikeFunction          # 脉冲函数（前向 Heaviside，反向 sigmoid 替代梯度）
-├── SpikeSelection         # 上下文感知脉冲选择，零初始化 → 恒等
+├── SpikeFunction          # 早期脉冲函数实现，当前 M1 主路径未直接使用
+├── SpikeRouter            # 连续路由器：输出 obs_base / obs_event / route_state
+├── SpikeSelection         # 兼容别名，继承自 SpikeRouter
 ├── MultiHeadAttentionBlock# 多头注意力（与 HyperIMTS 一致）
 ├── IrregularityAwareAttention # 不规则感知注意力（与 HyperIMTS 一致）
 ├── HypergraphEncoder      # 超图编码器（与 HyperIMTS 一致）
-├── HypergraphLearner      # 超图学习器（融合 Spike + Quaternion）
+├── HypergraphLearner      # 超图学习器（融合 Spike 路由 + 事件残差 + 条件 Quaternion）
 └── Model                  # 顶层模型类
 
 exp/exp_main.py            # 训练循环（AdamW for QSHNet, Adam for others）
 scripts/QSHNet/            # 各数据集的运行脚本
 configs/QSHNet/            # 各数据集的配置文件
+tests/models/test_QSHNet.py# M1 单元测试：路由初始化、条件 gate、模型前向 smoke test
 ```

@@ -104,6 +104,12 @@ class SpikeRouter(nn.Module):
         self.retain_log_scale = nn.Parameter(torch.tensor(0.0))
         self.event_log_scale = nn.Parameter(torch.tensor(-8.0))
 
+    def compute_retain_strength(self):
+        return torch.clamp(2.0 * torch.sigmoid(self.retain_log_scale) - 1.0, min=0.0, max=1.0)
+
+    def compute_event_strength(self):
+        return torch.sigmoid(self.event_log_scale)
+
     def forward(self, obs, mask_d, variable_incidence_matrix, variable_indices_flattened):
         """
         obs: (B, N, D) observation node features
@@ -123,9 +129,9 @@ class SpikeRouter(nn.Module):
         membrane = self.membrane_proj(
             torch.cat([obs, deviation], dim=-1)).squeeze(-1)  # (B, N)
         route_logit = membrane
-        retain_strength = torch.exp(self.retain_log_scale) - 1.0
+        retain_strength = self.compute_retain_strength()
         retain_gate = 1.0 - retain_strength * torch.sigmoid(-route_logit)
-        event_gate = torch.exp(self.event_log_scale) * torch.sigmoid(route_logit)
+        event_gate = self.compute_event_strength() * torch.sigmoid(route_logit)
         event_features = self.event_proj(torch.cat([obs, deviation], dim=-1))
         obs_base = obs * retain_gate.unsqueeze(-1) * mask_d
         obs_event = event_features * event_gate.unsqueeze(-1) * mask_d
@@ -314,6 +320,9 @@ class HypergraphLearner(nn.Module):
         result.masked_scatter_(mask, tf)
         return rearrange(result, "B L E D -> B E (L D)")
 
+    def compute_event_scale(self, layer_idx):
+        return torch.sigmoid(self.event_residual_scale[layer_idx] - 8.0)
+
     def compute_quaternion_gate(self, layer_idx, linear_out, event_gate):
         gate_input = torch.cat([linear_out, event_gate.unsqueeze(-1)], dim=-1)
         return torch.sigmoid(self.quat_gate[layer_idx](gate_input))
@@ -335,7 +344,7 @@ class HypergraphLearner(nn.Module):
             # their variable's context — true event-driven filtering
             obs_base, obs_event, route_state = self.spike_select[i](
                 observation_nodes, md, variable_incidence_matrix, variable_indices_flattened)
-            event_scale = torch.exp(self.event_residual_scale[i]) - 1.0
+            event_scale = self.compute_event_scale(i)
             temporal_event_delta = (temporal_incidence_matrix @ obs_event) / temporal_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
             variable_event_delta = (variable_incidence_matrix @ obs_event) / variable_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
 

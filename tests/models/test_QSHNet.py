@@ -45,6 +45,37 @@ class TestQSHNet(unittest.TestCase):
         self.assertTrue(torch.all(quat_gate <= 1.0))
         self.assertLess(quat_gate.mean().item(), 0.1)
 
+    def test_spike_router_keeps_retain_gate_bounded_when_scale_grows(self):
+        router = SpikeRouter(d_model=8)
+        router.retain_log_scale.data.fill_(5.0)
+
+        obs = torch.randn(2, 3, 8)
+        mask_d = torch.ones_like(obs)
+        variable_incidence_matrix = torch.tensor([
+            [[1.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+        ])
+        variable_indices_flattened = torch.tensor([
+            [0, 0, 1],
+            [0, 1, 0],
+        ])
+
+        _, _, route_state = router(
+            obs, mask_d, variable_incidence_matrix, variable_indices_flattened
+        )
+
+        self.assertTrue(torch.all(route_state["retain_gate"] >= 0.0))
+        self.assertTrue(torch.all(route_state["retain_gate"] <= 1.0))
+
+    def test_hypergraph_learner_event_residual_scale_is_bounded(self):
+        learner = HypergraphLearner(n_layers=1, d_model=8, n_heads=1, time_length=4)
+        learner.event_residual_scale[0].data.fill_(5.0)
+
+        event_scale = learner.compute_event_scale(0)
+
+        self.assertGreaterEqual(event_scale.item(), 0.0)
+        self.assertLessEqual(event_scale.item(), 1.0)
+
     def test_model_forward_runs_with_default_configs(self):
         configs = get_configs(args=["--model_name", "QSHNet", "--model_id", "QSHNet"])
         model = Model(configs)

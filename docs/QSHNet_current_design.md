@@ -1,7 +1,22 @@
-# QSH-Net 当前实现设计文档
+# QSH-Net 历史实现设计文档（2026-04-15 快照）
 
 > **最后更新：** 2026-04-15
-> **状态：** M1 分层协同实现已完成并完成多数据集实验；结构方向成立，当前需优先稳定化
+> **状态：** 历史设计快照，仅用于保留当时的实现思路与阶段性结果
+
+## 使用说明
+
+这份文档记录的是 **2026-04-15** 时点的 M1 设计与阶段性实验结果。
+
+它的用途是：
+
+- 保留当时的实现思路
+- 对照早期结构假设与当前实际演化之间的差异
+
+它**不是**当前状态的最终依据。查询当前模型情况时，优先看：
+
+- [QSHNet_overview.md](/opt/Codes/PyOmniTS/docs/QSHNet_overview.md)
+- [QSHNet_architecture_status.md](/opt/Codes/PyOmniTS/docs/QSHNet_architecture_status.md)
+- [hyperparameter_tuning_plan.md](/opt/Codes/PyOmniTS/docs/hyperparameter_tuning_plan.md)
 
 ---
 

@@ -115,6 +115,35 @@ class TestQSHNet(unittest.TestCase):
         self.assertLess(initial_scale, 0.12)
         self.assertLessEqual(capped_scale, 0.12 + 1e-6)
 
+    def test_event_scale_density_modulation_keeps_base_scale_at_baseline_density(self):
+        learner = HypergraphLearner(n_layers=1, d_model=8, n_heads=1, time_length=4)
+        base_scale = learner.compute_event_scale(0)
+        route_density = torch.full((2, 3, 1), learner.event_density_baseline)
+
+        modulated_scale = learner.modulate_event_scale(base_scale, route_density, target="variable")
+
+        expected_scale = torch.ones_like(route_density) * base_scale
+        self.assertTrue(torch.allclose(modulated_scale, expected_scale))
+
+    def test_event_scale_density_modulation_reduces_scale_for_dense_routes_on_variable_path(self):
+        learner = HypergraphLearner(n_layers=1, d_model=8, n_heads=1, time_length=4)
+        base_scale = torch.tensor(0.1)
+        route_density = torch.ones(2, 3, 1)
+
+        modulated_scale = learner.modulate_event_scale(base_scale, route_density, target="variable")
+
+        expected_scale = base_scale * (1.0 - learner.variable_event_density_penalty_max)
+        self.assertTrue(torch.allclose(modulated_scale, torch.full_like(route_density, expected_scale)))
+
+    def test_event_scale_density_modulation_keeps_temporal_path_unchanged_even_for_dense_routes(self):
+        learner = HypergraphLearner(n_layers=1, d_model=8, n_heads=1, time_length=4)
+        base_scale = torch.tensor(0.1)
+        route_density = torch.ones(2, 3, 1)
+
+        modulated_scale = learner.modulate_event_scale(base_scale, route_density, target="temporal")
+
+        self.assertTrue(torch.allclose(modulated_scale, torch.full_like(route_density, base_scale)))
+
     def test_spike_router_caps_retain_gate_drop_under_large_scale(self):
         router = SpikeRouter(d_model=8)
         obs = torch.randn(2, 3, 8)

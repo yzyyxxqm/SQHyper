@@ -1,6 +1,6 @@
 # QSH-Net 超参数与诊断计划
 
-> **最后更新：** 2026-04-16
+> **最后更新：** 2026-04-18
 
 ## 当前状态
 
@@ -32,6 +32,12 @@
 | `eventscalecap_main` | USHCN | 5 | **0.1663 ± 0.0027** | 与 `eventnorm_main` 接近，说明温和上界是安全保险丝 |
 | `eventnorm_itr10` | USHCN | 10 | **0.1829 ± 0.0279** | 长重复下仍有尾部风险，不能直接视为最终定版 |
 | `eventscalecap_itr10` | USHCN | 10 | **0.1728 ± 0.0222** | 明显优于 `eventnorm_itr10`，但仍保留尾部坏轮 |
+| `eventrescap_main` | HumanActivity | 3 | **0.04185 ± 0.00009** | HumanActivity 改善，但不足以证明方向成立 |
+| `eventrescap_main` | USHCN | 5 | **0.1834 ± 0.0273** | 相对主线明显退化，方向否决 |
+| `eventdenscap_main` | HumanActivity | 3 | **0.04181 ± 0.00011** | HumanActivity 改善保持 |
+| `eventdenscap_main` | USHCN | 5 | **0.1891 ± 0.0347** | 全路径 density 抑制明显更差，方向否决 |
+| `eventdensvar_main` | HumanActivity | 3 | **0.04181 ± 0.00011** | 保持 HumanActivity 改善 |
+| `eventdensvar_main` | USHCN | 5 | **0.1703 ± 0.0058** | 略弱于主线，但方差收敛明显，当前可接受保留候选 |
 
 ## 当前训练配置
 
@@ -151,6 +157,23 @@
    - 虽然明显优于 `eventfusion_sigmoid` 的长尾不稳定，但仍然出现 `iter5/7/8` 级别的坏轮。
    - 当前更准确的结论是：`eventnorm` 足以支撑三元素统一框架叙事，但还不能被视为最终工程定版。
 
+9. **`eventrescap_main` 否定了“直接给 event residual 加相对主干范数上界”这一方向。**
+   - `HumanActivity itr=3` 改善到 `0.04185 ± 0.00009`。
+   - 但 `USHCN itr=5` 退化到 `0.1834 ± 0.0273`。
+   - 这说明全局比例硬约束会把高方差数据上的有效 `event` 一起压掉。
+
+10. **`eventdenscap_main` 否定了“对 temporal + variable 全路径同时做 density-aware 衰减”这一方向。**
+   - `HumanActivity itr=3` 为 `0.04181 ± 0.00011`。
+   - 但 `USHCN itr=5` 进一步退化到 `0.1891 ± 0.0347`。
+   - 这说明 temporal 路径上的 density-aware 抑制不是安全保险丝，反而更像误伤有效注入。
+
+11. **`eventdensvar_main` 证明如果要引入 density-aware 控制，只能收窄到 variable 路径。**
+   - `HumanActivity itr=3` 维持在 `0.04181 ± 0.00011`。
+   - `USHCN itr=5` 为 `0.1703 ± 0.0058`。
+   - 相比 `eventscalecap_main` 的 `0.1663 ± 0.0027`，均值略差；
+   - 但相比 `eventrescap_main` / `eventdenscap_main`，它已经显著收敛，且没有再出现严重长尾。
+   - 当前更准确的定位是：它不是新的统一主线，但已经是可接受保留候选。
+
 ## 当前工作判断
 
 ### 现在不应该优先做的事
@@ -159,18 +182,21 @@
 - 把问题简单归结为 `event_gate` 没调好
 - 在 USHCN 上只看 3~5 轮结果就下结论
 - 继续无差别地加大 `event` 融合强度
+- 把 `eventrescap_main` / `eventdenscap_main` 这种全局收缩方向继续细调
 
 ### 当前最重要的判断
 
 1. **如果目标是追求最稳的短期结果，`retaincap_main` 仍然是最保守的稳定化版本。**
 2. **如果目标是保住论文里的三元素统一框架，当前更合适的主线候选已经升级为 `eventnorm + mild event_scale cap`。**
-3. **但 `eventscalecap_itr10` 仍然保留尾部坏轮，当前更适合写成“可训练、可控、已明显改善但尚未彻底稳定”的阶段性结论。**
+3. **`eventdensvar_main` 可以作为当前可接受保留候选，但还不应替代统一母体。**
+4. **`eventscalecap_itr10` 仍然保留尾部坏轮，当前更适合写成“可训练、可控、已明显改善但尚未彻底稳定”的阶段性结论。**
 
 ### 下一步建议
 
-1. 先以 `eventscalecap_main` / `eventscalecap_itr10` 作为当前统一框架候选版本。
-2. 暂不继续做大规模超参数扫描。
-3. 后续结构试验若继续推进，优先围绕 `event_scale` 工作区间或更细的尾部控制做单因素消融。
+1. 继续以 `eventscalecap_main` / `eventscalecap_itr10` 作为当前统一框架候选版本。
+2. 把 `eventdensvar_main` 记为当前可接受保留候选，用于后续 density-aware 方向的直接起点。
+3. 暂不继续做大规模超参数扫描。
+4. 后续结构试验若继续推进，优先围绕 variable 路径的更细粒度尾部控制做单因素消融，而不是回到全路径收缩。
 
 ## 运行与诊断方式
 
@@ -216,3 +242,188 @@ python main.py --is_training 1 --collate_fn collate_fn --loss MSE \
 - USHCN 需要 `itr >= 5`，更稳妥是 `itr = 10`
 - HumanActivity 用 `itr = 3` 即可做快速对照
 - 在已经确认 `event` 可以被唤醒之后，重点应转向“如何让它长期稳定”，而不是重新回到常规调参
+- `event density` 方向已经形成新约束：若继续推进，只看 variable 路径，不再同时动 temporal 路径
+
+## EQHO 开发阶段补充（2026-04-17）
+
+### 已完成的本地筛查
+
+在 `eventscalecap` 母体上完成了 `EQHO A3` 的本地筛查：
+
+| 配置 | 数据集 | 轮数 | MSE 均值 ± std | 结论 |
+|------|--------|------|----------------|------|
+| `QSHNet_EQHO_A3` | HumanActivity | 3 | `0.0418 ± 0.0002` | 稳定，可训练 |
+| `QSHNet_EQHO_A3` | USHCN | 5 | `0.1979 ± 0.0310` | 明显退化，方向失败 |
+
+### 关键诊断结论
+
+1. `EQHO` 不是死结构。
+   - `HumanActivity` 与 `USHCN` 上都能看到 `mix_coef / mix_gain / residual_norm_mean` 的真实变化。
+
+2. `A3` 的问题不是“没有学起来”，而是“学得过强”。
+   - `HumanActivity` 上仍然保持温和的 real-dominant refinement；
+   - `USHCN` 上完整动态 `mix_coef` 会快速偏离 real-dominant 区间，并伴随 `gain_mean`、`summary_mean`、`residual_norm_mean` 明显抬升。
+
+3. 因此 `EQHO A3` 的停机结论已经成立。
+   - 不再把 `A3` 视作当前主线候选；
+   - 也不再继续在它上面做常规超参数修补。
+
+### 后续约束更新
+
+- 当前主线仍是 `eventscalecap_main / eventscalecap_itr10`
+- 若继续推进 `EQHO`，下一步应优先做受限动态化版本（可记为 `A2.5`）
+- `A2.5` 的核心思想应是：
+  - 保留 real-dominant 模板；
+  - 仅允许 `mix_coef` 在安全边界内做小幅偏移；
+  - 不再直接放开完整 `r / i / j / k` mixing
+
+### `A2.5` 本地筛查结果（已完成）
+
+在 `A3` 之后，已完成 `A2.5` 的本地对照：
+
+| 配置 | 数据集 | 轮数 | MSE 均值 ± std | 结论 |
+|------|--------|------|----------------|------|
+| `QSHNet_EQHO_A25` | HumanActivity | 3 | `0.0418 ± 0.0002` | 安全，可训练，不伤简单数据 |
+| `QSHNet_EQHO_A25` | USHCN | 5 | `0.2062 ± 0.0264` | 仍明显退化，不能入主线 |
+
+### `A2.5` 带来的新结论
+
+1. `A2.5` 成功验证了 `A3` 的一部分归因。
+   - `mix_coef` 被限制在 real-dominant 安全区之后，`A3` 中那种完全偏离实部主导的失稳不再出现。
+
+2. 但 `A2.5` 没有把 `USHCN` 拉回主线水位。
+   - `USHCN itr=5` 仍为 `0.2062 ± 0.0264`；
+   - 甚至差于 `A3` 的 `0.1979 ± 0.0310`。
+
+3. 因此 `EQHO` 当前的主要风险判断需要更新为：
+   - 风险不再主要是 `mix_coef`；
+   - 更可能是 temporal 分支的 `mix_gain` 在高方差数据上持续接近饱和，导致 hyperedge quaternion refinement 仍被过强放大。
+
+### `EQHO` 后续唯一优先方向
+
+如果后续继续推进 `EQHO`，不要再重复：
+
+- 继续放宽 `mix_coef`
+- 或继续只围绕 `mix_coef` 做边界修补
+
+下一轮唯一最值得验证的核心假设应是：
+
+- 在保持 `A2.5` 的 real-dominant 模板与 safety floor 完全不变的前提下，
+- 只修改 `mix_gain` 的参数化或上界，
+- 验证 `USHCN` 坏轮是否能被进一步压回。
+
+### `A2.6` 本地筛查结果（已完成）
+
+按上面的方向，已完成 `mix_gain hard cap` 对照：
+
+| 配置 | 数据集 | 轮数 | MSE 均值 ± std | 结论 |
+|------|--------|------|----------------|------|
+| `QSHNet_EQHO_A26` | HumanActivity | 3 | `0.0418 ± 0.0003` | 与 `A2.5` 持平，说明 hard cap 不伤简单数据 |
+| `QSHNet_EQHO_A26` | USHCN | 5 | `0.1846 ± 0.0297` | 明显优于 `A25/A3`，但仍弱于主线 |
+
+### `A2.6` 带来的新结论
+
+1. `mix_gain hard cap` 确实有效。
+   - `USHCN` 上从 `A2.5` 的 `0.2062 ± 0.0264` 改善到 `0.1846 ± 0.0297`；
+   - 也优于 `A3` 的 `0.1979 ± 0.0310`。
+
+2. 但它仍然不是最终解。
+   - 仍明显差于 `eventscalecap_main` 的 `0.1663 ± 0.0027`；
+   - 且方差仍不够理想。
+
+3. 当前 `EQHO` 的问题层级应进一步上移：
+   - 不是只看 `mix_coef`
+   - 也不是只看 `mix_gain`
+   - 更可能是 `event_summary` 的幅值和统计形态本身，在高方差数据上仍会把后续分支推到高能区
+
+### `EQHO` 下一轮若继续的唯一合理方向
+
+如果后续还要继续推进 `EQHO`，不再优先做：
+
+- 继续压 `mix_coef` 边界
+- 继续仅调 `mix_gain_max`
+
+下一轮更值得验证的是：
+
+- `event_summary` 的归一化、幅值控制或统计重参数化
+
+而不是再单纯修补它后面的 `coef` / `gain` 投影头。
+
+### `S1` 本地筛查结果（已完成）
+
+按上面的方向，已完成 `event_summary` 输出端归一化对照：
+
+| 配置 | 数据集 | 轮数 | MSE 均值 ± std | 结论 |
+|------|--------|------|----------------|------|
+| `QSHNet_EQHO_S1` | HumanActivity | 3 | `0.0418 ± 0.0003` | 与 `A2.6` 基本持平，不伤简单数据 |
+| `QSHNet_EQHO_S1` | USHCN | 5 | `0.2072 ± 0.0461` | 虽压低 `summary` 统计量，但结果明显退化 |
+
+### `S1` 带来的新结论
+
+1. `event_summary` 输出端的 `LayerNorm` 能明显压低诊断统计量。
+   - `USHCN` 首轮 `QSHDiag` 中，temporal / variable `summary_mean` 大约只有 `0.20 / 0.22`；
+   - 与 `A2.6` 在 `USHCN` 上 `5 ~ 11` 的量级相比，输出尺度被大幅压平。
+
+2. 但这并没有带来更好的 `USHCN` 最终结果。
+   - `USHCN itr=5` 退化到 `0.2072 ± 0.0461`；
+   - 比 `A2.6` 的 `0.1846 ± 0.0297` 更差；
+   - 也差于 `A3` 的 `0.1979 ± 0.0310`。
+
+3. 因此当前可以排除一个简单假设：
+   - 问题不是“只要把 `event_summary` 输出幅值压下来就能修复 `USHCN`”
+   - 更深层的问题更可能在 `event_summary` 的信息组织方式，而不是单纯尺度大小
+
+### `S1` 后的约束更新
+
+如果后续还要继续推进 `EQHO`，不再优先做：
+
+- 继续仅调 `mix_gain_max`
+- 继续仅做 summarizer 输出端归一化
+
+更值得看的将是：
+
+- `event_summary` 的内部构造方式
+- `main/event/gate` 三路信息在 summarizer 内部的融合形式
+
+### `S2` 本地筛查结果（已完成）
+
+按上面的方向，已完成 summarizer 分路静态聚合对照：
+
+| 配置 | 数据集 | 轮数 | MSE 均值 ± std | 结论 |
+|------|--------|------|----------------|------|
+| `QSHNet_EQHO_S2` | HumanActivity | 3 | `0.0422 ± 0.0002` | 已伤简单数据，不如 `A2.6/S1` |
+| `QSHNet_EQHO_S2` | USHCN | 5 | `0.2218 ± 0.0336` | 明显更差，方向失败 |
+
+### `S2` 带来的新结论
+
+1. 把 summarizer 改成“分路投影 + 静态加权聚合”并不能修复 `EQHO`。
+2. `USHCN` 首轮诊断里，variable 支路 `coef_r` 已掉到 `0.56 ~ 0.61` 附近，说明这种改法会破坏 real-dominant 安全结构。
+3. 因此不能把 summarizer 的局部拓扑重写视为有效出路。
+
+### `S3` 本地筛查结果（已完成）
+
+随后又完成了更保守的 residual-style summarizer 对照：
+
+| 配置 | 数据集 | 轮数 | MSE 均值 ± std | 结论 |
+|------|--------|------|----------------|------|
+| `QSHNet_EQHO_S3` | HumanActivity | 3 | `0.0418 ± 0.0004` | 回到安全线附近，不伤简单数据 |
+| `QSHNet_EQHO_S3` | USHCN | 5 | `0.2173 ± 0.0340` | 仍明显退化，方向失败 |
+
+### `S3` 带来的新结论
+
+1. residual-style summarizer 比 `S2` 稳定，但仍无法修复 `USHCN`。
+2. 它说明“把 summarizer 改成主干主导的小残差结构”仍不足以解决 `EQHO` 的根本问题。
+3. 因此当前 `EQHO` 最优探索版本仍然是 `A2.6`，而不是任何 `S*` 版本。
+
+### `S2/S3` 后的约束更新
+
+如果后续还要继续推进 `EQHO`，不再优先做：
+
+- summarizer 输出端归一化
+- summarizer 分路静态聚合
+- summarizer residual-style 小修
+
+当前更合理的策略是：
+
+- 暂时冻结 `EQHO` 在 `A2.6`
+- 若要继续改，应重新提出更上层的结构假设，而不是继续在 summarizer 层修补

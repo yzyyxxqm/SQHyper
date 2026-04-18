@@ -298,6 +298,9 @@ class HypergraphLearner(nn.Module):
         self.event_residual_scale = nn.ParameterList([
             nn.Parameter(torch.tensor(initial_event_scale)) for _ in range(n_layers)])
         self.event_scale_max = 0.12
+        self.event_density_baseline = 0.5
+        self.temporal_event_density_penalty_max = 0.0
+        self.variable_event_density_penalty_max = 0.5
         self.temporal_event_norm = nn.ModuleList([
             nn.LayerNorm(d_model) for _ in range(n_layers)])
         self.variable_event_norm = nn.ModuleList([
@@ -351,9 +354,31 @@ class HypergraphLearner(nn.Module):
             max=self.event_scale_max,
         )
 
-    def apply_event_injection(self, layer_idx, main_state, event_delta, event_scale, target):
+    def get_event_density_penalty_max(self, target):
+        if target == "temporal":
+            return self.temporal_event_density_penalty_max
+        if target == "variable":
+            return self.variable_event_density_penalty_max
+        raise ValueError(f"Unknown event target: {target}")
+
+    def modulate_event_scale(self, base_event_scale, route_density, target):
+        penalty_max = self.get_event_density_penalty_max(target)
+        density_overflow = torch.clamp(
+            route_density - self.event_density_baseline,
+            min=0.0,
+        ) / max(1e-6, 1.0 - self.event_density_baseline)
+        attenuation = 1.0 - penalty_max * density_overflow
+        return base_event_scale * attenuation.clamp(min=1.0 - penalty_max, max=1.0)
+
+    def summarize_route_density(self, incidence_matrix, route_logit):
+        route_density = torch.sigmoid(route_logit).unsqueeze(-1)
+        return (incidence_matrix @ route_density) / incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
+
+    def apply_event_injection(self, layer_idx, main_state, event_delta, event_scale, target, route_density=None):
         if target not in {"temporal", "variable"}:
             raise ValueError(f"Unknown event target: {target}")
+        if route_density is not None:
+            event_scale = self.modulate_event_scale(event_scale, route_density, target)
         return main_state + event_scale * event_delta
 
     def forward(self, observation_nodes, temporal_hyperedges, variable_hyperedges,
@@ -378,6 +403,8 @@ class HypergraphLearner(nn.Module):
             variable_event_delta = (variable_incidence_matrix @ obs_event) / variable_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
             temporal_event_delta = self.normalize_event_delta(i, temporal_event_delta, target="temporal")
             variable_event_delta = self.normalize_event_delta(i, variable_event_delta, target="variable")
+            temporal_route_density = self.summarize_route_density(temporal_incidence_matrix, route_state["route_logit"])
+            variable_route_density = self.summarize_route_density(variable_incidence_matrix, route_state["route_logit"])
 
             # Node→temporal hyperedge (using spike-selected nodes)
             temporal_hyperedges_updated = self.node2temporal_hyperedge[i](
@@ -391,6 +418,7 @@ class HypergraphLearner(nn.Module):
                 event_delta=temporal_event_delta,
                 event_scale=event_scale,
                 target="temporal",
+                route_density=temporal_route_density,
             )
 
             if i == 0:
@@ -409,6 +437,7 @@ class HypergraphLearner(nn.Module):
                 event_delta=variable_event_delta,
                 event_scale=event_scale,
                 target="variable",
+                route_density=variable_route_density,
             )
 
             variable_hyperedges = variable_hyperedges_updated

@@ -120,6 +120,7 @@ class Exp_Main(Exp_Basic):
         if learner is None:
             return
 
+        debug_event_state = getattr(learner, 'debug_event_state', {}) or {}
         parts = []
         for layer_idx, router in enumerate(learner.spike_select):
             parts.append(
@@ -136,6 +137,55 @@ class Exp_Main(Exp_Basic):
                     learner.quat_h2n[layer_idx].i.detach().norm().item(),
                     learner.quat_h2n[layer_idx].j.detach().norm().item(),
                     learner.quat_h2n[layer_idx].k.detach().norm().item(),
+                )
+            )
+
+        def _tensor_stat(name: str, reduce: str = 'mean'):
+            value = debug_event_state.get(name)
+            if value is None:
+                return None
+            if value.numel() == 0:
+                return None
+            if reduce == 'mean':
+                return value.detach().float().mean().item()
+            if reduce == 'max':
+                return value.detach().float().max().item()
+            raise ValueError(f"Unknown reduce='{reduce}'")
+
+        temporal_mix_coef = debug_event_state.get("temporal_mix_coef")
+        variable_mix_coef = debug_event_state.get("variable_mix_coef")
+        temporal_mix_gain_mean = _tensor_stat("temporal_mix_gain")
+        variable_mix_gain_mean = _tensor_stat("variable_mix_gain")
+        temporal_eqho_residual_norm_mean = _tensor_stat("temporal_eqho_residual_norm_mean")
+        variable_eqho_residual_norm_mean = _tensor_stat("variable_eqho_residual_norm_mean")
+        temporal_event_summary_mean = _tensor_stat("temporal_event_summary")
+        variable_event_summary_mean = _tensor_stat("variable_event_summary")
+
+        if temporal_mix_coef is not None:
+            temporal_mix_coef_mean = temporal_mix_coef.detach().float().mean(dim=tuple(range(temporal_mix_coef.ndim - 1)))
+            parts.append(
+                "EQHO-temporal coef_r={:.4f} coef_i={:.4f} coef_j={:.4f} coef_k={:.4f} gain_mean={:.4f} summary_mean={:.4f} residual_norm_mean={:.4f}".format(
+                    temporal_mix_coef_mean[0].item(),
+                    temporal_mix_coef_mean[1].item(),
+                    temporal_mix_coef_mean[2].item(),
+                    temporal_mix_coef_mean[3].item(),
+                    temporal_mix_gain_mean if temporal_mix_gain_mean is not None else float('nan'),
+                    temporal_event_summary_mean if temporal_event_summary_mean is not None else float('nan'),
+                    temporal_eqho_residual_norm_mean if temporal_eqho_residual_norm_mean is not None else float('nan'),
+                )
+            )
+
+        if variable_mix_coef is not None:
+            variable_mix_coef_mean = variable_mix_coef.detach().float().mean(dim=tuple(range(variable_mix_coef.ndim - 1)))
+            parts.append(
+                "EQHO-variable coef_r={:.4f} coef_i={:.4f} coef_j={:.4f} coef_k={:.4f} gain_mean={:.4f} summary_mean={:.4f} residual_norm_mean={:.4f}".format(
+                    variable_mix_coef_mean[0].item(),
+                    variable_mix_coef_mean[1].item(),
+                    variable_mix_coef_mean[2].item(),
+                    variable_mix_coef_mean[3].item(),
+                    variable_mix_gain_mean if variable_mix_gain_mean is not None else float('nan'),
+                    variable_event_summary_mean if variable_event_summary_mean is not None else float('nan'),
+                    variable_eqho_residual_norm_mean if variable_eqho_residual_norm_mean is not None else float('nan'),
                 )
             )
 

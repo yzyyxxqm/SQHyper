@@ -48,6 +48,24 @@
 |------|------|
 | `MIMIC_IV` | 本地与服务器单次运行耗时都较高，当前阶段先不作为首轮验证对象 |
 
+如果需要单独验证 `MIMIC_IV`，使用独立脚本，不和四数据集并行脚本混跑：
+
+```bash
+bash scripts/QSHNet/server_validate_spikeselectprop_res005_mimic_iv.sh
+```
+
+建议先用 1 轮 smoke test 确认服务器数据缓存和维度无误：
+
+```bash
+ITR_MIMIC_IV=1 bash scripts/QSHNet/server_validate_spikeselectprop_res005_mimic_iv.sh
+```
+
+如果显存紧张，可以降低 batch size：
+
+```bash
+BATCH_SIZE_MIMIC_IV=16 ITR_MIMIC_IV=1 bash scripts/QSHNet/server_validate_spikeselectprop_res005_mimic_iv.sh
+```
+
 ## 3. 脚本入口
 
 ### 3.1 全数据集验证脚本

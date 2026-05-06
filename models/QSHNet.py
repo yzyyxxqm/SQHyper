@@ -270,11 +270,14 @@ class HypergraphEncoder(nn.Module):
 # ============================================================================
 
 class HypergraphLearner(nn.Module):
-    def __init__(self, n_layers, d_model, n_heads, time_length):
+    def __init__(self, n_layers, d_model, n_heads, time_length, no_quat=False, no_spike=False):
         super().__init__()
         self.n_layers = n_layers
         self.d_model = d_model
         self.activation = nn.ReLU()
+        # Ablation flags
+        self.no_quat = bool(no_quat)
+        self.no_spike = bool(no_spike)
 
         # === HyperIMTS core (identical) ===
         self.node2temporal_hyperedge = nn.ModuleList([
@@ -530,7 +533,19 @@ class HypergraphLearner(nn.Module):
             # their variable's context — true event-driven filtering
             obs_base, obs_event, route_state = self.spike_select[i](
                 observation_nodes, md, variable_incidence_matrix, variable_indices_flattened)
+            if self.no_spike:
+                # Ablation: bypass spike-driven event router, fall back to plain HyperIMTS path
+                obs_base = observation_nodes * md
+                obs_event = torch.zeros_like(obs_event)
+                route_state = {
+                    "route_logit": torch.zeros_like(route_state["route_logit"]),
+                    "event_gate": torch.zeros_like(route_state["event_gate"]),
+                    "retain_gate": torch.ones_like(route_state["retain_gate"]),
+                    "selection_weight": torch.full_like(route_state["selection_weight"], 0.5),
+                }
             event_scale = self.compute_event_scale(i)
+            if self.no_spike:
+                event_scale = torch.zeros_like(event_scale)
             temporal_event_delta = (temporal_incidence_matrix @ obs_event) / temporal_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
             variable_event_delta = (variable_incidence_matrix @ obs_event) / variable_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
             temporal_event_delta = self.normalize_event_delta(i, temporal_event_delta, target="temporal")
@@ -646,6 +661,9 @@ class HypergraphLearner(nn.Module):
             quat_out = self.quat_h2n[i](linear_out)
             # Additive refinement with learnable gate (starts near 0 → pure HyperIMTS)
             alpha = self.compute_quaternion_gate(i, linear_out, route_state["event_gate"])
+            if self.no_quat:
+                # Ablation: drop quaternion refinement entirely (h2n_out = linear_out)
+                alpha = torch.zeros_like(alpha)
             quat_residual = self.bound_quaternion_residual(linear_out, quat_out, alpha)
             quat_diag = self.summarize_quaternion_diagnostics(
                 linear_out=linear_out,
@@ -698,7 +716,11 @@ class Model(nn.Module):
         tl = sl + pl
 
         self.hypergraph_encoder = HypergraphEncoder(self.enc_in, tl, D)
-        self.hypergraph_learner = HypergraphLearner(configs.n_layers, D, configs.n_heads, tl)
+        self.hypergraph_learner = HypergraphLearner(
+            configs.n_layers, D, configs.n_heads, tl,
+            no_quat=getattr(configs, "qshnet_no_quat", 0),
+            no_spike=getattr(configs, "qshnet_no_spike", 0),
+        )
         self.hypergraph_decoder = nn.Linear(3 * D, 1)
 
     def pad_and_flatten(self, tensor, mask, max_len):

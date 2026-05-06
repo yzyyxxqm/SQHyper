@@ -166,6 +166,9 @@ def get_configs(args=None) -> ExpConfigs:
     parser.add_argument('--patchtst_subtract_last', type=int, default=0, help='0: subtract mean; 1: subtract last')
     # PrimeNet
     parser.add_argument('--primenet_pooling', type=str, default='ave', help='[ave, att, bert]: What pooling to use to aggregate the model output sequence representation for different tasks.')
+    # QSHNet ablations
+    parser.add_argument('--qshnet_no_quat', type=int, default=0, help='Ablation: 1 = disable Quaternion Refinement (h2n_out = linear_out only).')
+    parser.add_argument('--qshnet_no_spike', type=int, default=0, help='Ablation: 1 = disable Spike Selection (skip event router; obs_selected = obs).')
     # ReIMTS
     parser.add_argument('--reimts_pad_time_emb', type=int, default=1, help='Whether to pad temporal embedding')
     # ScaleFormer

@@ -157,6 +157,9 @@ class ExpConfigs:
     patchtst_subtract_last: int
     # PrimeNet
     primenet_pooling: str
+    # QSHNet ablations
+    qshnet_no_quat: int
+    qshnet_no_spike: int
     # ReIMTS
     reimts_pad_time_emb: int
     # ScaleFormer

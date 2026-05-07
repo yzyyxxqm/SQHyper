@@ -185,6 +185,12 @@ class ExpConfigs:
     scperqh_tau_decay: float
     scperqh_lambda_div: float
     scperqh_lambda_commit: float
+    # STHQ-Net (Spike-Triggered Hyperedge with Quaternion States)
+    sthq_k_t: int
+    sthq_k_v: int
+    sthq_omega_min: float
+    sthq_omega_max: float
+    sthq_use_he_attn_from_layer: int
     # ReIMTS
     reimts_pad_time_emb: int
     # ScaleFormer

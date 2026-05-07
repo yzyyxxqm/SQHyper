@@ -194,6 +194,12 @@ def get_configs(args=None) -> ExpConfigs:
     parser.add_argument('--scperqh_tau_decay', type=float, default=0.999, help='SC-PERQH: temperature decay per step.')
     parser.add_argument('--scperqh_lambda_div', type=float, default=0.05, help='SC-PERQH: per-group diversity loss weight.')
     parser.add_argument('--scperqh_lambda_commit', type=float, default=0.005, help='SC-PERQH: per-group commitment loss weight.')
+    # STHQ-Net (Spike-Triggered Hyperedge with Quaternion States)
+    parser.add_argument('--sthq_k_t', type=int, default=32, help='STHQ: number of temporal hyperedges per layer.')
+    parser.add_argument('--sthq_k_v', type=int, default=16, help='STHQ: number of variable hyperedges per layer.')
+    parser.add_argument('--sthq_omega_min', type=float, default=0.02, help='STHQ: minimum temporal bandwidth (relative to seq).')
+    parser.add_argument('--sthq_omega_max', type=float, default=0.5, help='STHQ: maximum temporal bandwidth.')
+    parser.add_argument('--sthq_use_he_attn_from_layer', type=int, default=1, help='STHQ: from which layer index to enable hyperedge self-attention.')
     # ReIMTS
     parser.add_argument('--reimts_pad_time_emb', type=int, default=1, help='Whether to pad temporal embedding')
     # ScaleFormer

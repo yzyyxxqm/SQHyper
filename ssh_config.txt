@@ -1,0 +1,4 @@
+{
+ssh root@sc01-ssh.gpuhome.cc -p 30432
+password：kws1c1gn
+}

@@ -182,6 +182,18 @@ def get_configs(args=None) -> ExpConfigs:
     parser.add_argument('--perqh_tau_decay', type=float, default=0.999, help='PE-RQH: temperature decay per step.')
     parser.add_argument('--perqh_lambda_div', type=float, default=0.1, help='PE-RQH: codebook diversity loss weight.')
     parser.add_argument('--perqh_lambda_commit', type=float, default=0.01, help='PE-RQH: codebook commitment loss weight.')
+    # SC-PERQH (Structured-Codebook Pure Event-Routed Quaternion Hypergraph)
+    parser.add_argument('--scperqh_k_time', type=int, default=32, help='SC-PERQH: number of time-codes (Fourier-init).')
+    parser.add_argument('--scperqh_k_var', type=int, default=8, help='SC-PERQH: number of variable-codes (orthogonal init).')
+    parser.add_argument('--scperqh_k_event', type=int, default=32, help='SC-PERQH: number of event-codes (random init).')
+    parser.add_argument('--scperqh_top_t', type=int, default=2, help='SC-PERQH: top-k from time-codes.')
+    parser.add_argument('--scperqh_top_v', type=int, default=2, help='SC-PERQH: top-k from var-codes.')
+    parser.add_argument('--scperqh_top_e', type=int, default=3, help='SC-PERQH: top-k from event-codes.')
+    parser.add_argument('--scperqh_tau_init', type=float, default=1.0, help='SC-PERQH: initial Gumbel-softmax temperature.')
+    parser.add_argument('--scperqh_tau_min', type=float, default=0.5, help='SC-PERQH: min temperature.')
+    parser.add_argument('--scperqh_tau_decay', type=float, default=0.999, help='SC-PERQH: temperature decay per step.')
+    parser.add_argument('--scperqh_lambda_div', type=float, default=0.05, help='SC-PERQH: per-group diversity loss weight.')
+    parser.add_argument('--scperqh_lambda_commit', type=float, default=0.005, help='SC-PERQH: per-group commitment loss weight.')
     # ReIMTS
     parser.add_argument('--reimts_pad_time_emb', type=int, default=1, help='Whether to pad temporal embedding')
     # ScaleFormer

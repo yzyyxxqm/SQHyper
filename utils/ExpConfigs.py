@@ -173,6 +173,18 @@ class ExpConfigs:
     perqh_tau_decay: float
     perqh_lambda_div: float
     perqh_lambda_commit: float
+    # SC-PERQH (Structured-Codebook PE-RQH)
+    scperqh_k_time: int
+    scperqh_k_var: int
+    scperqh_k_event: int
+    scperqh_top_t: int
+    scperqh_top_v: int
+    scperqh_top_e: int
+    scperqh_tau_init: float
+    scperqh_tau_min: float
+    scperqh_tau_decay: float
+    scperqh_lambda_div: float
+    scperqh_lambda_commit: float
     # ReIMTS
     reimts_pad_time_emb: int
     # ScaleFormer

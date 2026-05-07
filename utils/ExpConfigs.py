@@ -165,6 +165,14 @@ class ExpConfigs:
     # SQHyper ablations
     sqhyper_no_sgi: int
     sqhyper_no_qmf: int
+    # PE-RQH (Pure Event-Routed Quaternion Hypergraph)
+    perqh_n_codes: int
+    perqh_top_m: int
+    perqh_tau_init: float
+    perqh_tau_min: float
+    perqh_tau_decay: float
+    perqh_lambda_div: float
+    perqh_lambda_commit: float
     # ReIMTS
     reimts_pad_time_emb: int
     # ScaleFormer

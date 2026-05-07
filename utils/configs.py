@@ -174,6 +174,14 @@ def get_configs(args=None) -> ExpConfigs:
     # SQHyper ablations
     parser.add_argument('--sqhyper_no_sgi', type=int, default=0, help='Ablation: 1 = disable Spike-Gated Incidence (g_n=1, e_n=0).')
     parser.add_argument('--sqhyper_no_qmf', type=int, default=0, help='Ablation: 1 = disable Quaternion Multi-Source Fusion (use flat Linear).')
+    # PE-RQH (Pure Event-Routed Quaternion Hypergraph)
+    parser.add_argument('--perqh_n_codes', type=int, default=64, help='PE-RQH: codebook size K.')
+    parser.add_argument('--perqh_top_m', type=int, default=3, help='PE-RQH: top-m soft assignment per observation.')
+    parser.add_argument('--perqh_tau_init', type=float, default=1.0, help='PE-RQH: initial Gumbel-softmax temperature.')
+    parser.add_argument('--perqh_tau_min', type=float, default=0.5, help='PE-RQH: minimum Gumbel-softmax temperature.')
+    parser.add_argument('--perqh_tau_decay', type=float, default=0.999, help='PE-RQH: temperature decay per step.')
+    parser.add_argument('--perqh_lambda_div', type=float, default=0.1, help='PE-RQH: codebook diversity loss weight.')
+    parser.add_argument('--perqh_lambda_commit', type=float, default=0.01, help='PE-RQH: codebook commitment loss weight.')
     # ReIMTS
     parser.add_argument('--reimts_pad_time_emb', type=int, default=1, help='Whether to pad temporal embedding')
     # ScaleFormer

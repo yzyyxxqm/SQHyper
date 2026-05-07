@@ -43,7 +43,7 @@ for pred_len in 3; do
     --itr 5 \
     --batch_size 16 \
     --learning_rate 1e-3 \
-    --sthq_k_t 24 \
+    --sthq_k_t 48 \
     --sthq_k_v 5 \
     --sthq_omega_min 0.02 \
     --sthq_omega_max 0.4 \

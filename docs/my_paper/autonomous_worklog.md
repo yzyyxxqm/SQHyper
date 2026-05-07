@@ -45,4 +45,51 @@ Available time: ~9 hours
 ### 15:05 UTC — Iteration 1 started
 - STHQ with query-distribution bug FIXED running on 4 datasets
 - All smoke tests pass including regression test
-- Next check: 15:45 UTC
+
+### 16:17 UTC — Iteration 1 results (82 min runtime)
+- USHCN full 5 iters: MSE 0.254/0.229/0.248/0.185/0.198 -> mean 0.223 ± 0.027
+  - Best 0.185 beats SQHyper 0.191; mean 17% worse
+- P12 iter 2: val 0.357 (was stuck at 0.40)
+- MIMIC_III iter 0 (80min!): val 0.578, 7/10 counter (too slow, will be killed)
+- HumanActivity iter 4: val 0.162 (5x improvement vs PE-RQH 0.32)
+
+### 16:25 UTC — Iteration 2 started (v2)
+Changes:
+  - Time-aware decoder: concat(q_final, q_initial, sin/cos(time), var_emb)
+  - Dropout 0.1 on msg_proj + decoder
+  - Anti-collapse aux loss (τ-repulsion + var-entropy bonus)
+  - MIMIC: d_model 256→128, K_t/K_v 32/24→24/16, itr 5→3, patience 10→7
+  - P12 patience 10→7
+  - Loss: MSE_aux to include aux_loss in total
+Next check: 17:10 UTC (after ~45 min, expect USHCN done + MIMIC 1-2 iters)
+
+### 17:10 UTC — 45 min into v2
+- USHCN best val 0.194 (similar to v1)
+- P12 plateauing at 0.344
+- MIMIC iter 0 at 0.608 (descending slowly)
+- HA best val 0.138 (better than v1 0.162) ✅
+
+### 17:56 UTC — 90 min into v2 — MAJOR RESULTS
+🎉 USHCN: ALL 5 ITERS DONE
+  Test MSEs: 0.177, 0.211, 0.182, 0.171, 0.170
+  Mean 0.182 ± 0.015
+  v1: 0.223 ± 0.027 (best 0.185)
+  v2: 0.182 ± 0.015 (best 0.170)
+  ✅ BEATS SQHyper baseline 0.191 by 5%
+  ✅ Variance halved
+
+🎉 HumanActivity: ALL 5 ITERS DONE
+  Test MSEs: 0.085, 0.103, 0.095, 0.103, 0.092
+  Mean 0.096 ± 0.008
+  vs PE-RQH/SC-PERQH 0.32, much better
+
+P12: iter 1/5, val 0.354 (slower descent)
+MIMIC: iter 0/3, val 0.588, counter 3/7
+
+Time analysis:
+- 17:56 UTC → 6h 4min remaining
+- P12: ~2-3 hours more (5 iters)
+- MIMIC: ~2 hours more (3 iters)
+- Buffer: ~2 hours for analysis/final touches
+
+Decision: let everything finish. Monitor at 19:30 UTC.

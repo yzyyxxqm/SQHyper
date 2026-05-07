@@ -244,8 +244,13 @@ class STHQLayer(nn.Module):
         self.edge_proj_t = QuaternionLinear(d_model, d_model)
         self.edge_proj_v = QuaternionLinear(d_model, d_model)
 
-        # After Hamilton composition, project messages back
-        self.msg_proj = QuaternionLinear(d_model, d_model)
+        # Hybrid Hamilton + Linear message paths.
+        #   msg_path_h : Hamilton-composed messages (typed-quaternion product)
+        #   msg_path_l : direct linear messages (no quaternion structure)
+        # Mix via learnable scalar α ∈ [0,1] per-layer.
+        self.msg_proj_h = QuaternionLinear(d_model, d_model)
+        self.msg_proj_l = nn.Linear(d_model, d_model)
+        self.alpha_logit = nn.Parameter(torch.tensor(0.0))  # sigmoid(0)=0.5
         self.norm = QuaternionLayerNorm(d_model)
         self.dropout = nn.Dropout(0.1)
 
@@ -314,10 +319,12 @@ class STHQLayer(nn.Module):
         h_temp_per_cell = m_dist_t_norm @ h_temp                  # [B, N, D]
         h_var_per_cell = m_dist_v_norm @ h_var
 
-        msg_temp = hamilton_product(h_temp_per_cell, q)
-        msg_var = hamilton_product(h_var_per_cell, q)
-
-        msg = self.msg_proj(msg_temp + msg_var)
+        # Hybrid message: blend Hamilton-product path with linear path.
+        h_per_cell = h_temp_per_cell + h_var_per_cell
+        msg_h = hamilton_product(h_per_cell, q)        # [B, N, D] Hamilton path
+        msg_l = h_per_cell                             # [B, N, D] linear path
+        alpha = torch.sigmoid(self.alpha_logit)
+        msg = alpha * self.msg_proj_h(msg_h) + (1 - alpha) * self.msg_proj_l(msg_l)
         msg = self.dropout(msg)
         q_new = self.norm(q + msg)
         return q_new * mask.unsqueeze(-1)

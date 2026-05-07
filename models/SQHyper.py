@@ -271,6 +271,13 @@ class HypergraphLearner(nn.Module):
         # === SGI: Spike-Gated Incidence (per layer) ===
         self.sgi = nn.ModuleList([
             SpikeGatedIncidence(D) for _ in range(n_layers)])
+        # Per-layer learnable gating strength for K/V gating in n2h.
+        # gate_scale = 0 → identity (no K/V gating), let the model decide
+        # whether to activate gating. Mitigates K/V info loss on smooth data
+        # (e.g. USHCN) while preserving strong gating capability on event-rich
+        # data (e.g. HumanActivity).
+        self.gate_scale = nn.ParameterList([
+            nn.Parameter(torch.zeros(1)) for _ in range(n_layers)])
 
         # === QMF: Quaternion Multi-Source Fusion (per layer) ===
         # Project each source from D to D/4 (quaternion component)
@@ -325,7 +332,19 @@ class HypergraphLearner(nn.Module):
                     device=observation_nodes.device, dtype=observation_nodes.dtype)
 
             # Spike-gated observation for K/V in n2h attention
-            obs_gated = observation_nodes * g_n.unsqueeze(-1)
+            # Residual gating that interpolates between mask-only and full SGI:
+            #   gating = mask + gate_scale * (g_n - mask)
+            #   gate_scale = 0 → mask (HyperIMTS-equivalent, no soft gating)
+            #   gate_scale = 1 → g_n  (full SGI gating)
+            # Always preserves mask (padded positions stay zero).
+            # Model can learn appropriate gating strength per layer per dataset.
+            if not self.no_sgi:
+                gs = self.gate_scale[i]
+                mask_2d = x_y_mask_flattened.unsqueeze(-1)
+                gating = mask_2d + gs * (g_n.unsqueeze(-1) - mask_2d)
+                obs_gated = observation_nodes * gating
+            else:
+                obs_gated = observation_nodes * g_n.unsqueeze(-1)
 
             # ============================================================
             # Step 2: Node → Hyperedge (with spike-gated K/V)

@@ -191,6 +191,8 @@ class ExpConfigs:
     sthq_omega_min: float
     sthq_omega_max: float
     sthq_use_he_attn_from_layer: int
+    sthq_lambda_tau: float
+    sthq_lambda_var: float
     # ReIMTS
     reimts_pad_time_emb: int
     # ScaleFormer

@@ -82,6 +82,7 @@ class Data(tsdmDataset):
         self._check_lengths()
         self._preprocess()
         self._get_sample_index() # overwrite self.sample_index=None in parent class
+        self._apply_train_fraction() # no-op when --train_fraction == 1.0 (default)
 
     def __getitem__(self, index): # redundant, just for clarity
         return super().__getitem__(index)

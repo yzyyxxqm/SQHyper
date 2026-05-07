@@ -15,15 +15,15 @@ get_dataset_info "$dataset_name" "$dataset_subset_name" # Get dataset informatio
 model_name="$(basename "$(dirname "$(readlink -f "$0")")")" # folder name
 model_id=$model_name
 
-seq_len=150
+seq_len=36
 for pred_len in 3; do
     $launch_command main.py \
     --is_training 1 \
     --collate_fn "collate_fn" \
     --loss "MSE" \
-    --d_model 64 \
-    --n_layers 1 \
-    --n_heads 1 \
+    --d_model 256 \
+    --n_layers 2 \
+    --n_heads 8 \
     --use_multi_gpu $use_multi_gpu \
     --dataset_root_path $dataset_root_path \
     --model_id $model_id \
@@ -40,6 +40,6 @@ for pred_len in 3; do
     --patience 10 \
     --val_interval 1 \
     --itr 5 \
-    --batch_size 16 \
+    --batch_size 32 \
     --learning_rate 1e-3
 done

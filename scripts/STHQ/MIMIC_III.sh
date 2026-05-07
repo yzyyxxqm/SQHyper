@@ -21,8 +21,8 @@ for pred_len in 3; do
     $launch_command main.py \
     --is_training 1 \
     --collate_fn "collate_fn" \
-    --loss "MSE" \
-    --d_model 256 \
+    --loss "MSE_aux" \
+    --d_model 128 \
     --n_layers 3 \
     --n_heads 1 \
     --use_multi_gpu $use_multi_gpu \
@@ -38,13 +38,13 @@ for pred_len in 3; do
     --dec_in $n_variables \
     --c_out $n_variables \
     --train_epochs 300 \
-    --patience 10 \
+    --patience 7 \
     --val_interval 1 \
-    --itr 5 \
+    --itr 3 \
     --batch_size 32 \
     --learning_rate 1e-3 \
-    --sthq_k_t 32 \
-    --sthq_k_v 24 \
+    --sthq_k_t 24 \
+    --sthq_k_v 16 \
     --sthq_omega_min 0.03 \
     --sthq_omega_max 0.4 \
     --sthq_use_he_attn_from_layer 1

@@ -260,7 +260,84 @@ class tsdmDataset(Dataset):
     @abstractmethod
     def _get_sample_index(self):
         ...
-    
+
+    def _apply_train_fraction(self):
+        """Subsample training samples for data-scaling ablations.
+
+        Only acts when ``self.flag == 'train'`` and
+        ``self.configs.train_fraction < 1.0``. Validation and test sets are
+        never touched.
+
+        Uses ``train_fraction_seed`` (independent of per-iter training seed)
+        so the same subset is reused across iters at a given fraction, keeping
+        the comparison fair across configs at the same data scale.
+        """
+        if self.flag != "train":
+            return
+        frac = getattr(self.configs, "train_fraction", 1.0)
+        if frac is None or frac >= 1.0:
+            return
+        if frac <= 0.0 or frac > 1.0:
+            raise ValueError(f"--train_fraction must be in (0, 1], got {frac}")
+
+        seed = int(getattr(self.configs, "train_fraction_seed", 0) or 0)
+        n_total = len(self.dataset)
+        n_keep = max(1, int(round(n_total * frac)))
+
+        g = torch.Generator()
+        g.manual_seed(seed)
+        perm = torch.randperm(n_total, generator=g)[:n_keep]
+        perm, _ = perm.sort()
+        keep = perm.tolist()
+
+        from torch.utils.data import Subset
+        self.dataset = Subset(self.dataset, keep)
+
+        if isinstance(self.sample_index, torch.Tensor) and len(self.sample_index) == n_total:
+            self.sample_index = self.sample_index[perm]
+        else:
+            self.sample_index = torch.tensor(keep)
+
+        logger.info(
+            f"[train_fraction] {self.configs.dataset_name}: "
+            f"train subset {n_total} -> {n_keep} (frac={frac}, seed={seed})"
+        )
+
+
+def subsample_train_dataset(dataset, sample_index, frac, seed, dataset_name="<unknown>"):
+    """Module-level helper for datasets that don't inherit tsdmDataset
+    (e.g. HumanActivity). Returns (new_dataset, new_sample_index).
+    No-op when frac >= 1.0.
+    """
+    if frac is None or frac >= 1.0:
+        return dataset, sample_index
+    if frac <= 0.0 or frac > 1.0:
+        raise ValueError(f"--train_fraction must be in (0, 1], got {frac}")
+
+    n_total = len(dataset)
+    n_keep = max(1, int(round(n_total * frac)))
+
+    g = torch.Generator()
+    g.manual_seed(int(seed or 0))
+    perm = torch.randperm(n_total, generator=g)[:n_keep]
+    perm, _ = perm.sort()
+    keep = perm.tolist()
+
+    from torch.utils.data import Subset
+    new_dataset = Subset(dataset, keep)
+
+    if isinstance(sample_index, torch.Tensor) and len(sample_index) == n_total:
+        new_sample_index = sample_index[perm]
+    else:
+        new_sample_index = torch.tensor(keep)
+
+    logger.info(
+        f"[train_fraction] {dataset_name}: "
+        f"train subset {n_total} -> {n_keep} (frac={frac}, seed={int(seed or 0)})"
+    )
+    return new_dataset, new_sample_index
+
+
 def fix_nan_x_mark(x_mark, seq_len, l_total):
     # Create a tensor of indices
     BATCH_SIZE, SEQ_LEN_MAX_IRR, _ = x_mark.shape

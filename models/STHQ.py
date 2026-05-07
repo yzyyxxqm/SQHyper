@@ -247,6 +247,7 @@ class STHQLayer(nn.Module):
         # After Hamilton composition, project messages back
         self.msg_proj = QuaternionLinear(d_model, d_model)
         self.norm = QuaternionLayerNorm(d_model)
+        self.dropout = nn.Dropout(0.1)
 
         # Optional hyperedge self-attention (deep layers)
         if use_he_attn:
@@ -317,6 +318,7 @@ class STHQLayer(nn.Module):
         msg_var = hamilton_product(h_var_per_cell, q)
 
         msg = self.msg_proj(msg_temp + msg_var)
+        msg = self.dropout(msg)
         q_new = self.norm(q + msg)
         return q_new * mask.unsqueeze(-1)
 
@@ -362,11 +364,26 @@ class Model(nn.Module):
                 use_he_attn=use_he_attn,
             ))
 
+        # Time-aware decoder: explicitly sees query (time, var) embedding
+        # plus skip connection from initial cell encoding.
+        D_time_emb = 32
+        self.dec_time_freqs = nn.Parameter(
+            torch.exp(torch.linspace(0.0, math.log(50.0), D_time_emb // 2)))
+        self.dec_var_emb = nn.Embedding(configs.enc_in, D_time_emb)
+        nn.init.normal_(self.dec_var_emb.weight, std=0.1)
+        dec_in_dim = D + D + D_time_emb * 2  # q_final + q_initial + [time_emb, var_emb]
         self.decoder = nn.Sequential(
-            nn.Linear(D, D),
+            nn.Linear(dec_in_dim, D),
             nn.GELU(),
-            nn.Linear(D, 1),
+            nn.Dropout(0.1),
+            nn.Linear(D, D // 2),
+            nn.GELU(),
+            nn.Linear(D // 2, 1),
         )
+
+        # Anti-collapse regularization weights
+        self.lambda_tau = float(getattr(configs, "sthq_lambda_tau", 0.01))
+        self.lambda_var = float(getattr(configs, "sthq_lambda_var", 0.005))
 
     # ---- helpers (shared with PE-RQH structure) --------------------------
     def pad_and_flatten(self, tensor, mask, max_len):
@@ -474,7 +491,7 @@ class Model(nn.Module):
             x_L_flattened, times_flat, contribute_mask, var_ids_flat)
 
         # Encode to quaternion state (uses contribute_mask for value gating)
-        q = self.cell_encoder(
+        q_initial = self.cell_encoder(
             value=x_L_flattened,
             time_norm=times_flat,
             var_id=var_ids_flat,
@@ -484,6 +501,7 @@ class Model(nn.Module):
 
         # STHQ layers — query positions still get to receive messages but
         # don't contribute to forming hyperedges (spike=0 for them).
+        q = q_initial
         for layer in self.layers:
             q = layer(
                 q=q,
@@ -493,11 +511,36 @@ class Model(nn.Module):
                 mask=valid_mask,
             )
 
-        pred_flattened = self.decoder(q).squeeze(-1)
+        # Time-aware decoder: [q_final | q_initial | sin/cos(time) | var_emb]
+        t_phase = times_flat.unsqueeze(-1) * self.dec_time_freqs  # [B, N, T_emb/2]
+        time_emb = torch.cat([torch.sin(t_phase), torch.cos(t_phase)], dim=-1)
+        var_emb = self.dec_var_emb(var_ids_flat)
+        decoder_input = torch.cat([q, q_initial, time_emb, var_emb], dim=-1)
+        pred_flattened = self.decoder(decoder_input).squeeze(-1)
+
+        # ---- anti-collapse auxiliary loss ------------------------------------
+        # τ repulsion: encourage temporal anchors to spread out within [0, 1]
+        # Penalize pairs of τ's that are too close (< 0.5 * ω_mean).
+        aux_loss = pred_flattened.new_zeros(())
+        if self.training:
+            for layer in self.layers:
+                tau = layer.tau                                # [K_t]
+                omega = torch.exp(layer.omega_log)             # [K_t]
+                # Pairwise distances scaled by mean ω
+                d_tau = (tau.unsqueeze(0) - tau.unsqueeze(1)).abs()
+                mask_pair = ~torch.eye(tau.numel(), dtype=torch.bool, device=tau.device)
+                min_spacing = 0.5 * omega.mean()
+                repulse = F.relu(min_spacing - d_tau) ** 2
+                aux_loss = aux_loss + self.lambda_tau * repulse[mask_pair].mean()
+                # Variable affinity: penalize near-collapse of softmax (entropy bonus)
+                var_softmax = F.softmax(layer.var_affinity, dim=-1)
+                ent = -(var_softmax * (var_softmax.clamp_min(1e-8)).log()).sum(-1).mean()
+                aux_loss = aux_loss - self.lambda_var * ent
         result = {
             "pred": pred_flattened,
             "true": y_L_flattened,
             "mask": y_mask_L_flattened,
+            "aux_loss": aux_loss,
         }
 
         if self.configs.task_name in ['long_term_forecast', 'short_term_forecast', 'imputation']:

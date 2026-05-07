@@ -21,7 +21,7 @@ for pred_len in 3; do
     $launch_command main.py \
     --is_training 1 \
     --collate_fn "collate_fn" \
-    --loss "MSE" \
+    --loss "MSE_aux" \
     --d_model 256 \
     --n_layers 3 \
     --n_heads 1 \

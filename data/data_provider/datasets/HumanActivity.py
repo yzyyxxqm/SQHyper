@@ -15,6 +15,7 @@ from data.dependencies.tsdm.PyOmniTS.tsdmDataset import (  # collate_fns must be
     collate_fn_fractal,
     collate_fn_patch,
     collate_fn_tpatch,
+    subsample_train_dataset,
 )
 from utils.ExpConfigs import ExpConfigs
 from utils.globals import logger
@@ -61,6 +62,14 @@ class Data(Dataset):
         self._check_lengths()
         self._preprocess()
         self._get_sample_index()
+        if self.flag == "train":
+            self.data, self.sample_index = subsample_train_dataset(
+                self.data,
+                self.sample_index,
+                getattr(self.configs, "train_fraction", 1.0),
+                getattr(self.configs, "train_fraction_seed", 0),
+                dataset_name="HumanActivity",
+            )
 
     def __getitem__(self, index):
         sample_dict: dict[str, Tensor] = self.data[index]

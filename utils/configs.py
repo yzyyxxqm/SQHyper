@@ -200,6 +200,8 @@ def get_configs(args=None) -> ExpConfigs:
     parser.add_argument('--sthq_omega_min', type=float, default=0.02, help='STHQ: minimum temporal bandwidth (relative to seq).')
     parser.add_argument('--sthq_omega_max', type=float, default=0.5, help='STHQ: maximum temporal bandwidth.')
     parser.add_argument('--sthq_use_he_attn_from_layer', type=int, default=1, help='STHQ: from which layer index to enable hyperedge self-attention.')
+    parser.add_argument('--sthq_lambda_tau', type=float, default=0.01, help='STHQ: τ-repulsion regularization weight.')
+    parser.add_argument('--sthq_lambda_var', type=float, default=0.005, help='STHQ: variable-affinity entropy bonus weight.')
     # ReIMTS
     parser.add_argument('--reimts_pad_time_emb', type=int, default=1, help='Whether to pad temporal embedding')
     # ScaleFormer

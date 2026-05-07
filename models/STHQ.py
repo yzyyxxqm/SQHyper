@@ -256,33 +256,44 @@ class STHQLayer(nn.Module):
     def forward(self, q, spike_intensity, time_norm, var_id, mask):
         """
         q              : [B, N, 4Q]  cell state
-        spike_intensity: [B, N]      salience in [0,1]
+        spike_intensity: [B, N]      salience in [0,1] (zero on query positions)
         time_norm      : [B, N]      time normalized to [0,1]
         var_id         : [B, N] long
-        mask           : [B, N]      observation mask in {0,1}
+        mask           : [B, N]      valid-position mask {0,1} (1 for both
+                                     observations AND forecast queries)
         Returns: q' [B, N, 4Q]
+
+        Membership matrices (separated to allow query cells to RECEIVE without
+        contributing to hyperedge formation):
+          - m_aggr (with spike): cell -> hyperedge (only observed cells with
+            non-zero spike contribute to forming hyperedges)
+          - m_dist (without spike): hyperedge -> cell (queries also receive
+            messages based purely on their (time, var) coordinates)
         """
         B, N, D = q.shape
-        # ---- temporal membership weights -------------------------------------
-        # m_temp[b, i, k] = spike_i * exp(-(t_i - τ_k)^2 / 2 ω_k^2)
-        omega = torch.exp(self.omega_log).clamp(min=1e-3)        # [K_t]
-        diff = time_norm.unsqueeze(-1) - self.tau.view(1, 1, -1)  # [B, N, K_t]
-        kernel = torch.exp(-0.5 * (diff / omega.view(1, 1, -1)) ** 2)
-        m_temp = spike_intensity.unsqueeze(-1) * kernel * mask.unsqueeze(-1)
-        # ---- variable membership ---------------------------------------------
-        # m_var[b, i, k] = spike_i * softmax_over_k(A[var_i])
-        var_logits = self.var_affinity[var_id]                    # [B, N, K_v]
-        var_w = F.softmax(var_logits, dim=-1)
-        m_var = spike_intensity.unsqueeze(-1) * var_w * mask.unsqueeze(-1)
+        # ---- kernels (position-only, no spike) ------------------------------
+        omega = torch.exp(self.omega_log).clamp(min=1e-3)         # [K_t]
+        diff = time_norm.unsqueeze(-1) - self.tau.view(1, 1, -1)   # [B, N, K_t]
+        kernel_temp = torch.exp(-0.5 * (diff / omega.view(1, 1, -1)) ** 2)
+        var_logits = self.var_affinity[var_id]                     # [B, N, K_v]
+        kernel_var = F.softmax(var_logits, dim=-1)
 
-        # ---- aggregate cells into hyperedges (B, K, D) -----------------------
-        # h_temp[b, k] = (Σ_i m_temp[b,i,k] q[b,i,:]) / (Σ_i m_temp + ε)
-        denom_t = m_temp.sum(dim=1, keepdim=True).clamp_min(1e-6)  # [B, 1, K_t]
-        h_temp = (m_temp.transpose(1, 2) @ q) / denom_t.transpose(1, 2)
-        denom_v = m_var.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        h_var = (m_var.transpose(1, 2) @ q) / denom_v.transpose(1, 2)
+        # ---- aggregation membership (cell -> hyperedge): spike-gated --------
+        m_aggr_t = spike_intensity.unsqueeze(-1) * kernel_temp * mask.unsqueeze(-1)
+        m_aggr_v = spike_intensity.unsqueeze(-1) * kernel_var  * mask.unsqueeze(-1)
 
-        # Per-edge-type projection
+        # ---- distribution membership (hyperedge -> cell): position-only -----
+        # No spike factor — query positions receive messages too.
+        m_dist_t = kernel_temp * mask.unsqueeze(-1)
+        m_dist_v = kernel_var  * mask.unsqueeze(-1)
+
+        # ---- aggregate cells -> hyperedges (B, K, D) ------------------------
+        denom_t = m_aggr_t.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        h_temp = (m_aggr_t.transpose(1, 2) @ q) / denom_t.transpose(1, 2)
+        denom_v = m_aggr_v.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        h_var = (m_aggr_v.transpose(1, 2) @ q) / denom_v.transpose(1, 2)
+
+        # Per-edge-type quaternion projection
         h_temp = self.edge_proj_t(h_temp)
         h_var = self.edge_proj_v(h_var)
 
@@ -294,20 +305,13 @@ class STHQLayer(nn.Module):
             h_temp = H_new[:, :self.k_t]
             h_var = H_new[:, self.k_t:]
 
-        # ---- distribute back to cells via Hamilton product ------------------
-        # For each cell i: msg = Σ_k norm_m_temp[i,k] · (h_temp[k] ⊗ q[i])
-        # Compute weighted Hamilton products. We compute (h ⊗ q) per (i, k)
-        # implicitly by aggregating h first into an (i)-weighted average then
-        # taking a single Hamilton product. This is an approximation:
-        #     Σ_k m[i,k] · (h_k ⊗ q[i]) ≈ (Σ_k m[i,k] · h_k) ⊗ q[i]
-        # Hamilton product is bilinear in h_k for fixed q[i], so this is exact.
-        # cell-side membership normalization (rows sum to 1 per i)
-        m_temp_norm = m_temp / m_temp.sum(dim=2, keepdim=True).clamp_min(1e-6)
-        m_var_norm = m_var / m_var.sum(dim=2, keepdim=True).clamp_min(1e-6)
-
-        # Σ_k m[i,k] · h[k] -> per-cell hyperedge context [B, N, D]
-        h_temp_per_cell = m_temp_norm @ h_temp                    # [B, N, D]
-        h_var_per_cell = m_var_norm @ h_var
+        # ---- distribute hyperedges -> cells via Hamilton product ------------
+        # Cell-side normalization of distribution weights (rows sum to 1).
+        # Hamilton bilinearity: Σ_k m[i,k] · (h_k ⊗ q[i]) = (Σ_k m[i,k] · h_k) ⊗ q[i]
+        m_dist_t_norm = m_dist_t / m_dist_t.sum(dim=2, keepdim=True).clamp_min(1e-6)
+        m_dist_v_norm = m_dist_v / m_dist_v.sum(dim=2, keepdim=True).clamp_min(1e-6)
+        h_temp_per_cell = m_dist_t_norm @ h_temp                  # [B, N, D]
+        h_var_per_cell = m_dist_v_norm @ h_var
 
         msg_temp = hamilton_product(h_temp_per_cell, q)
         msg_var = hamilton_product(h_var_per_cell, q)

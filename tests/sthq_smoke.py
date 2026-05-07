@@ -116,10 +116,44 @@ def test_model():
     assert out_test["pred"].shape == (B, PL, V)
 
 
+def test_query_receives_messages():
+    """Regression test: query positions (forecast targets, spike=0) MUST
+    still receive hyperedge messages and have their state updated.
+
+    Bug fixed 2026-05-07: previously m_norm used aggregation-spike-gated
+    weights for distribution, causing queries to get zero messages.
+    """
+    print("--- Query position update ---")
+    torch.manual_seed(42)
+    cfg = FakeConfigs()
+    model = Model(cfg)
+    model.eval()
+
+    B, L, V = 2, cfg.seq_len, cfg.enc_in
+    PL = cfg.pred_len
+    x = torch.randn(B, L, V)
+    x_mask = torch.ones(B, L, V)
+    y = torch.zeros(B, PL, V)
+    y_mask = torch.ones(B, PL, V)
+
+    # Run twice with different observed values; query positions should give
+    # different outputs (proving they receive observed-value information).
+    out1 = model(x=x, x_mask=x_mask, y=y, y_mask=y_mask, exp_stage="test")
+    out2 = model(x=x * 5 + 7, x_mask=x_mask, y=y, y_mask=y_mask, exp_stage="test")
+    diff = (out1["pred"] - out2["pred"]).abs().max().item()
+    print(f"  query pred diff with different observations: {diff:.4f}")
+    assert diff > 1e-3, (
+        f"Query positions did NOT respond to observation changes (diff={diff:.2e}). "
+        f"They are receiving zero messages — bug regression!"
+    )
+    print("  OK: queries receive non-trivial messages")
+
+
 def main():
     test_kron_equivalence()
     test_hamilton_bilinear()
     test_model()
+    test_query_receives_messages()
     print("\n✅ All smoke tests passed.")
 
 

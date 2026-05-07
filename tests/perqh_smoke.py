@@ -1,8 +1,10 @@
 # Smoke test for PE-RQH: forward + backward on synthetic data, CPU only.
+import os
 import sys
 import torch
 
-sys.path.insert(0, '/opt/Codes/PyOmniTS')
+# Add repo root to sys.path so this works from any cwd / install location.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.PERQH import Model
 

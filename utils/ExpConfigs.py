@@ -40,6 +40,8 @@ class ExpConfigs:
     target_variable_name: str
     train_val_loader_drop_last: int
     train_val_loader_shuffle: int
+    train_fraction: float
+    train_fraction_seed: int
 
     # forecasting task
     label_len: int
@@ -160,6 +162,9 @@ class ExpConfigs:
     # QSHNet ablations
     qshnet_no_quat: int
     qshnet_no_spike: int
+    # SQHyper ablations
+    sqhyper_no_sgi: int
+    sqhyper_no_qmf: int
     # ReIMTS
     reimts_pad_time_emb: int
     # ScaleFormer

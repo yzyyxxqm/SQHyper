@@ -49,6 +49,8 @@ def get_configs(args=None) -> ExpConfigs:
     parser.add_argument('--target_variable_name', type=str, default="OT", help='target variable name in regular time series forecasting datasets. Originally named as --target.')
     parser.add_argument('--train_val_loader_drop_last', type=int, default=0, help="By default, train and val loader will not drop the last batch if the number of samples is not sufficient.")
     parser.add_argument('--train_val_loader_shuffle', type=int, default=1, help="By default, train and val loader are shuffled.")
+    parser.add_argument('--train_fraction', type=float, default=1.0, help='Fraction of training samples to keep (validation/test untouched). Used for data-scaling ablations. 1.0 = use full training set.')
+    parser.add_argument('--train_fraction_seed', type=int, default=0, help='Random seed for the train-fraction subsample (only takes effect when --train_fraction < 1.0). Independent of the per-iter training seed so the same subset is reused across iters of the same fraction.')
 
     # forecasting task
     parser.add_argument('--label_len', type=int, default=0, help='start token length. In other words, the length prepanded to the input of decoder. Only used in some regular time series forecasting models.')
@@ -169,6 +171,9 @@ def get_configs(args=None) -> ExpConfigs:
     # QSHNet ablations
     parser.add_argument('--qshnet_no_quat', type=int, default=0, help='Ablation: 1 = disable Quaternion Refinement (h2n_out = linear_out only).')
     parser.add_argument('--qshnet_no_spike', type=int, default=0, help='Ablation: 1 = disable Spike Selection (skip event router; obs_selected = obs).')
+    # SQHyper ablations
+    parser.add_argument('--sqhyper_no_sgi', type=int, default=0, help='Ablation: 1 = disable Spike-Gated Incidence (g_n=1, e_n=0).')
+    parser.add_argument('--sqhyper_no_qmf', type=int, default=0, help='Ablation: 1 = disable Quaternion Multi-Source Fusion (use flat Linear).')
     # ReIMTS
     parser.add_argument('--reimts_pad_time_emb', type=int, default=1, help='Whether to pad temporal embedding')
     # ScaleFormer

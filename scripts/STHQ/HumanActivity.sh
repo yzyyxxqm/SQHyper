@@ -43,9 +43,11 @@ for pred_len in 3; do
     --itr 5 \
     --batch_size 16 \
     --learning_rate 1e-3 \
-    --sthq_k_t 256 \
+    --sthq_k_t 128 \
     --sthq_k_v 12 \
-    --sthq_omega_min 0.003 \
+    --sthq_k_t_per_layer "384,128,32" \
+    --sthq_omega_min 0.004 \
     --sthq_omega_max 0.2 \
-    --sthq_use_he_attn_from_layer 1
+    --sthq_use_he_attn_from_layer 1 \
+    --sthq_diag_interval 200
 done

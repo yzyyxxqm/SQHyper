@@ -30,6 +30,10 @@ class FakeConfigs:
     sthq_omega_min = 0.05
     sthq_omega_max = 0.5
     sthq_use_he_attn_from_layer = 1
+    sthq_lambda_tau = 0.0
+    sthq_lambda_var = 0.0
+    sthq_k_t_per_layer = ""
+    sthq_diag_interval = 0
 
 
 def test_kron_equivalence():
@@ -149,11 +153,52 @@ def test_query_receives_messages():
     print("  OK: queries receive non-trivial messages")
 
 
+def test_multiscale_kt():
+    """Verify per-layer K_t schedule is applied correctly."""
+    print("--- Multi-scale K_t ---")
+    cfg = FakeConfigs()
+    cfg.n_layers = 3
+    cfg.sthq_k_t_per_layer = "16,8,4"
+    model = Model(cfg)
+    kts = [layer.k_t for layer in model.layers]
+    print(f"  kt per layer: {kts}")
+    assert kts == [16, 8, 4], f"K_t schedule mismatch: {kts}"
+    # τ shape per layer should match K_t
+    for l, layer in enumerate(model.layers):
+        assert layer.tau.numel() == kts[l], (
+            f"Layer {l}: tau has {layer.tau.numel()} but expected {kts[l]}"
+        )
+    # Forward should still work
+    B, L, V = 2, cfg.seq_len, cfg.enc_in
+    x = torch.randn(B, L, V)
+    out = model(x=x, exp_stage="train")
+    assert out["pred"].dim() == 2 and out["pred"].shape[0] == B
+    assert torch.isfinite(out["pred"]).all()
+    print(f"  pred shape: {tuple(out['pred'].shape)}")
+    print("  OK: multi-scale K_t accepted and forward works")
+
+
+def test_diagnostic_logging():
+    """Verify diagnostic logging triggers without error."""
+    print("--- Diagnostic logging ---")
+    cfg = FakeConfigs()
+    cfg.sthq_diag_interval = 1  # log every step
+    model = Model(cfg)
+    model.train()
+    B, L, V = 2, cfg.seq_len, cfg.enc_in
+    x = torch.randn(B, L, V)
+    out = model(x=x, exp_stage="train")  # should print diag once
+    out = model(x=x, exp_stage="train")  # and again
+    print("  OK: diagnostic logging executed")
+
+
 def main():
     test_kron_equivalence()
     test_hamilton_bilinear()
     test_model()
     test_query_receives_messages()
+    test_multiscale_kt()
+    test_diagnostic_logging()
     print("\n✅ All smoke tests passed.")
 
 

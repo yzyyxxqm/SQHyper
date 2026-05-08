@@ -45,7 +45,9 @@ for pred_len in 3; do
     --learning_rate 1e-3 \
     --sthq_k_t 48 \
     --sthq_k_v 5 \
+    --sthq_k_t_per_layer "96,48,24" \
     --sthq_omega_min 0.02 \
     --sthq_omega_max 0.4 \
-    --sthq_use_he_attn_from_layer 1
+    --sthq_use_he_attn_from_layer 1 \
+    --sthq_diag_interval 200
 done

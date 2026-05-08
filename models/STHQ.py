@@ -352,6 +352,21 @@ class Model(nn.Module):
         self.use_he_attn_from = int(getattr(configs, "sthq_use_he_attn_from_layer",
                                             max(1, self.n_layers // 2)))
 
+        # ---- multi-scale per-layer K_t schedule ------------------------------
+        # Comma-separated layer-specific K_t (e.g. "192,64,16" for n_layers=3).
+        # Empty string → all layers share the global k_t.
+        # Layer 0 sees the finest scale (most anchors, narrowest ω); deeper
+        # layers progressively coarsen, providing global aggregation.
+        kt_sched_str = str(getattr(configs, "sthq_k_t_per_layer", "")).strip()
+        if kt_sched_str:
+            kt_per_layer = [int(s) for s in kt_sched_str.split(",")]
+            assert len(kt_per_layer) == self.n_layers, (
+                f"sthq_k_t_per_layer has {len(kt_per_layer)} entries but "
+                f"n_layers={self.n_layers}")
+        else:
+            kt_per_layer = [self.k_t] * self.n_layers
+        self.kt_per_layer = kt_per_layer
+
         Q = D // 4
         self.spike_encoder = SpikeEncoder(configs.enc_in, hidden=Q)
         self.cell_encoder = CellEncoder(D, configs.enc_in)
@@ -362,7 +377,7 @@ class Model(nn.Module):
             self.layers.append(STHQLayer(
                 d_model=D,
                 n_vars=configs.enc_in,
-                k_t=self.k_t,
+                k_t=kt_per_layer[l],
                 k_v=self.k_v,
                 omega_min=self.omega_min,
                 omega_max=self.omega_max,
@@ -391,6 +406,52 @@ class Model(nn.Module):
         # Anti-collapse regularization weights
         self.lambda_tau = float(getattr(configs, "sthq_lambda_tau", 0.01))
         self.lambda_var = float(getattr(configs, "sthq_lambda_var", 0.005))
+
+        # ---- diagnostic logging ----------------------------------------------
+        # Print spike / α / τ / hyperedge usage every diag_interval forward
+        # passes during training. Set to 0 to disable.
+        self.diag_interval = int(getattr(configs, "sthq_diag_interval", 0))
+        self.register_buffer("_diag_step", torch.zeros(1, dtype=torch.long),
+                             persistent=False)
+
+    # ---- diagnostics -----------------------------------------------------
+    def _log_diagnostics(self, spike_intensity, contribute_mask):
+        """Print spike / α / τ / ω / var-affinity entropy every diag_interval
+        forward passes during training. Cheap (tensor reductions only)."""
+        if self.diag_interval <= 0 or not self.training:
+            return
+        # increment in-place to keep on-device tracking
+        self._diag_step += 1
+        if (self._diag_step.item() - 1) % self.diag_interval != 0:
+            return
+        with torch.no_grad():
+            active = contribute_mask.bool()
+            if active.any():
+                vs = spike_intensity[active]
+                sm = vs.mean().item()
+                ss = vs.std().item()
+                sa = (vs > 0.5).float().mean().item()
+            else:
+                sm = ss = sa = 0.0
+            layer_stats = []
+            for l, layer in enumerate(self.layers):
+                alpha = torch.sigmoid(layer.alpha_logit).item()
+                tau_min = layer.tau.min().item()
+                tau_max = layer.tau.max().item()
+                tau_std = layer.tau.std().item()
+                om = torch.exp(layer.omega_log).mean().item()
+                va_sm = F.softmax(layer.var_affinity, dim=-1)
+                ent = (-(va_sm * va_sm.clamp_min(1e-8).log()).sum(-1).mean()).item()
+                layer_stats.append(
+                    f"L{l}(K_t={layer.k_t}): α={alpha:.2f} "
+                    f"τ∈[{tau_min:.2f},{tau_max:.2f}] τ_std={tau_std:.3f} "
+                    f"ω̄={om:.3f} var_ent={ent:.2f}"
+                )
+        logger.debug(
+            f"[STHQ diag step={self._diag_step.item()}] "
+            f"spike: mean={sm:.3f} std={ss:.3f} active={sa:.3f}; "
+            f"{' | '.join(layer_stats)}"
+        )
 
     # ---- helpers (shared with PE-RQH structure) --------------------------
     def pad_and_flatten(self, tensor, mask, max_len):
@@ -496,6 +557,8 @@ class Model(nn.Module):
         # Spike intensity is computed only on contribute cells (mask gates)
         spike_intensity = self.spike_encoder(
             x_L_flattened, times_flat, contribute_mask, var_ids_flat)
+        # Periodic diagnostics on spike / hyperedge state
+        self._log_diagnostics(spike_intensity, contribute_mask)
 
         # Encode to quaternion state (uses contribute_mask for value gating)
         q_initial = self.cell_encoder(

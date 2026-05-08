@@ -202,6 +202,8 @@ def get_configs(args=None) -> ExpConfigs:
     parser.add_argument('--sthq_use_he_attn_from_layer', type=int, default=1, help='STHQ: from which layer index to enable hyperedge self-attention.')
     parser.add_argument('--sthq_lambda_tau', type=float, default=0.01, help='STHQ: τ-repulsion regularization weight.')
     parser.add_argument('--sthq_lambda_var', type=float, default=0.005, help='STHQ: variable-affinity entropy bonus weight.')
+    parser.add_argument('--sthq_k_t_per_layer', type=str, default='', help='STHQ: comma-separated per-layer K_t (multi-scale). Empty = all layers share --sthq_k_t.')
+    parser.add_argument('--sthq_diag_interval', type=int, default=0, help='STHQ: log spike/τ/α stats every N forward passes during training (0=disabled).')
     # ReIMTS
     parser.add_argument('--reimts_pad_time_emb', type=int, default=1, help='Whether to pad temporal embedding')
     # ScaleFormer

@@ -93,3 +93,36 @@ Time analysis:
 - Buffer: ~2 hours for analysis/final touches
 
 Decision: let everything finish. Monitor at 19:30 UTC.
+
+### 23:09 UTC — Iteration 3 started (v3)
+v2 results showed gap to HyperIMTS still big on P12/MIMIC/HA.
+v3 changes:
+  - Hybrid Hamilton + Linear msg path (learnable α)
+  - K_t/K_v scaled per dataset:
+    USHCN: 24/5 → 48/5
+    P12: 24/16 → 48/24
+    MIMIC: 24/16 → 48/32, d_model 128 → 192
+    HA: 64/12 → 256/12
+  - HA omega range tightened
+
+### 2026-05-08 00:40 UTC — User stopping server
+v3 status:
+  USHCN ✅ ALL 5 ITERS DONE
+    Test MSEs: 0.170, 0.165, 0.179, 0.171, 0.174
+    Mean 0.172 ± 0.005 (best result of all attempts)
+    vs HyperIMTS-like 0.167 ± 0.004 → essentially MATCHED (within 1σ)
+  
+  HumanActivity: 4 iters early-stopped, 5th in progress (val_best 0.130)
+  P12: iter 0 early-stopped (val 0.370), iter 1 just started
+  MIMIC: iter 0 still running (val 0.570)
+
+Final STHQ best results compiled:
+  USHCN:        0.172 ± 0.005 (v3) vs HyperIMTS 0.167  — MATCHED
+  P12:          0.355 ± 0.007 (v2) vs HyperIMTS 0.301  — gap +18%
+  MIMIC_III:    0.568 ± 0.014 (v2) vs HyperIMTS 0.394  — gap +44%
+  HumanActivity: 0.096 ± 0.008 (v2) vs HyperIMTS 0.042 — gap +130%
+
+Goal "明显优于 HyperIMTS" NOT achieved.
+USHCN now matches; P12/MIMIC/HA still significantly behind.
+
+Final analysis written to STHQ_final_analysis.md

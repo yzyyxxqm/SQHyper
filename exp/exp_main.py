@@ -104,8 +104,11 @@ class Exp_Main(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self, model: Module) -> optim.Optimizer:
-        model_optim = optim.Adam(model.parameters(), lr=self.configs.learning_rate)
-        return model_optim
+        wd = getattr(self.configs, "weight_decay", 0.0)
+        if wd and wd > 0.0:
+            logger.info(f"Using AdamW with weight_decay={wd}")
+            return optim.AdamW(model.parameters(), lr=self.configs.learning_rate, weight_decay=wd)
+        return optim.Adam(model.parameters(), lr=self.configs.learning_rate)
 
     def _select_lr_scheduler(self, optimizer: optim.Optimizer) -> LRScheduler:
         # Initialize scheduler based on configs.lradj

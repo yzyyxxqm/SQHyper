@@ -76,6 +76,7 @@ def get_configs(args=None) -> ExpConfigs:
     parser.add_argument('--loss', type=str, default='MSE', help='loss function. PyOmniTS will try to construct the loss function from class Loss in loss_fns/LOSS.py')
     parser.add_argument('--lr_scheduler', type=str, choices=["ExponentialDecayLR", "ManualMilestonesLR", "DelayedStepDecayLR", "CosineAnnealingLR", "MultiStepLR", "StepLR"], default='DelayedStepDecayLR', help='learning rate scheduler. Originally named as --lradj')
     parser.add_argument('--lr_scheduler_gamma', type=float, default=0.1, help='gamma for StepLR and MultiStepLR.')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='AdamW weight_decay. When 0 (default), uses plain Adam. When > 0, switches to AdamW with this decay.')
     parser.add_argument('--n_train_stages', type=int, default=1, help="Some models have multiple training stages, like pretraining + finetuning. e.g., --n_train_stages 2 will pass train_stage=1 and train_stage=2 to model during training.")
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
     parser.add_argument('--patience', type=int, default=5, help='early stopping patience')

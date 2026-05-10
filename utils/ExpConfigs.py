@@ -67,6 +67,7 @@ class ExpConfigs:
     loss: str
     lr_scheduler: str
     lr_scheduler_gamma: float
+    weight_decay: float
     n_train_stages: str
     num_workers: int
     patience: int

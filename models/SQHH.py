@@ -743,13 +743,15 @@ class Model(nn.Module):
             for _ in range(self.n_layers)
         ])
 
-        # Time-aware decoder (re-uses the STHQ v6 design — vanilla downstream)
-        D_time_emb = 32
-        self.dec_time_freqs = nn.Parameter(
-            torch.exp(torch.linspace(0.0, math.log(50.0), D_time_emb // 2)))
-        self.dec_var_emb = nn.Embedding(self.enc_in, D_time_emb)
-        nn.init.normal_(self.dec_var_emb.weight, std=0.1)
-        dec_in_dim = D + D + D_time_emb * 2
+        # Decoder: HyperIMTS-style gather of time/variable hyperedge summaries.
+        # Instead of learning per-timestep hyperedges via message passing (which
+        # would require a full SQHyper backbone), we derive them by spike-weighted
+        # scatter-mean aggregation of the final quaternion cell states. This
+        # gives the decoder the critical 'what else was happening at this cell's
+        # time / variable' context that HyperIMTS / SQHyper rely on, while letting
+        # spike directly gate each cell's contribution to its time / variable
+        # bucket -- a mechanism not present in HyperIMTS.
+        dec_in_dim = 4 * D  # q_final | q_init | time_summary | var_summary
         self.decoder = nn.Sequential(
             nn.Linear(dec_in_dim, D), nn.GELU(), nn.Dropout(0.1),
             nn.Linear(D, D // 2), nn.GELU(),
@@ -762,6 +764,55 @@ class Model(nn.Module):
             "_diag_step", torch.zeros(1, dtype=torch.long), persistent=False)
 
     # ---- helpers (shared with HyperIMTS / SQHyper / STHQ) ---------------
+
+    def _gather_summaries(self, q: Tensor, mask: Tensor, spike: Tensor,
+                           time_id: Tensor, var_id: Tensor,
+                           L: int, V: int):
+        """Spike-weighted time / variable hyperedge summaries.
+
+        For each cell, gather the weighted-mean quaternion state over:
+          - all cells sharing the same time index (time_summary)
+          - all cells sharing the same variable index (var_summary)
+
+        Weight w = mask * (1 + spike) makes padded cells contribute 0 and
+        high-spike cells dominate their bucket. This restores HyperIMTS's
+        hyperedge-gather mechanism at decode time while giving spike a direct,
+        contextful role.
+
+        Args:
+          q:        [B, N, D] final quaternion cell states
+          mask:     [B, N] 0/1
+          spike:    [B, N] in [0, 1]
+          time_id:  [B, N] long in [0, L)
+          var_id:   [B, N] long in [0, V)
+
+        Returns:
+          time_ctx: [B, N, D] — per-cell time-bucket summary, broadcast back
+          var_ctx:  [B, N, D] — per-cell variable-bucket summary, broadcast back
+        """
+        B, N, D = q.shape
+        w = (mask * (1.0 + spike)).unsqueeze(-1)  # [B, N, 1]
+        qw = q * w  # [B, N, D]
+
+        # ----- time bucket -----
+        t_idx = time_id.clamp(0, L - 1).unsqueeze(-1)  # [B, N, 1]
+        t_num = torch.zeros(B, L, D, device=q.device, dtype=q.dtype)
+        t_den = torch.zeros(B, L, 1, device=q.device, dtype=q.dtype)
+        t_num.scatter_add_(1, t_idx.expand(-1, -1, D), qw)
+        t_den.scatter_add_(1, t_idx, w)
+        t_sum = t_num / t_den.clamp_min(1e-6)  # [B, L, D]
+        time_ctx = t_sum.gather(1, t_idx.expand(-1, -1, D))  # [B, N, D]
+
+        # ----- variable bucket -----
+        v_idx = var_id.clamp(0, V - 1).unsqueeze(-1)  # [B, N, 1]
+        v_num = torch.zeros(B, V, D, device=q.device, dtype=q.dtype)
+        v_den = torch.zeros(B, V, 1, device=q.device, dtype=q.dtype)
+        v_num.scatter_add_(1, v_idx.expand(-1, -1, D), qw)
+        v_den.scatter_add_(1, v_idx, w)
+        v_sum = v_num / v_den.clamp_min(1e-6)  # [B, V, D]
+        var_ctx = v_sum.gather(1, v_idx.expand(-1, -1, D))  # [B, N, D]
+
+        return time_ctx, var_ctx
 
     def pad_and_flatten(self, tensor, mask, max_len):
         B = tensor.shape[0]
@@ -894,11 +945,17 @@ class Model(nn.Module):
         for blk in self.blocks:
             q = blk(q, spike, time_norm, var_id, mask)
 
-        # Time-aware decoder
-        t_phase = time_norm.unsqueeze(-1) * self.dec_time_freqs
-        time_emb = torch.cat([torch.sin(t_phase), torch.cos(t_phase)], dim=-1)
-        var_emb = self.dec_var_emb(var_id)
-        decoder_input = torch.cat([q, q_init, time_emb, var_emb], dim=-1)
+        # Spike-weighted time/variable hyperedge summaries.
+        # Aggregate per time-bucket and per variable-bucket using scatter-mean.
+        # Weight = mask * (1 + spike): padded cells get 0, high-spike cells
+        # dominate their bucket summary.
+        time_ctx, var_ctx = self._gather_summaries(
+            q=q, mask=mask, spike=spike,
+            time_id=time_indices_flattened,
+            var_id=var_id, L=L, V=ENC_IN,
+        )
+
+        decoder_input = torch.cat([q, q_init, time_ctx, var_ctx], dim=-1)
         pred_flattened = self.decoder(decoder_input).squeeze(-1)
 
         # Optional diagnostic

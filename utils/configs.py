@@ -63,6 +63,7 @@ def get_configs(args=None) -> ExpConfigs:
     # GPU
     parser.add_argument('--allow_tf32', type=int, default=1, help='Whether PyTorch is allowed to use the TensorFloat32 (TF32) tensor cores, available on NVIDIA GPUs since Ampere. If set to 1, model accuracy will be lower, but speed can be faster. Refer to https://docs.pytorch.org/docs/stable/notes/cuda.html#tf32-on-ampere')
     parser.add_argument('--use_compile', type=int, default=0, help='Whether to wrap the model with torch.compile (PyTorch 2.x graph compiler). Adds ~30s first-batch overhead but typically gives 20-40%% speedup on subsequent batches. Set to 1 to enable, 0 to disable. Uses dynamic=True and mode="default" for IMTS variable-length compatibility.')
+    parser.add_argument('--use_amp', type=int, default=0, help='Whether to enable automatic mixed precision training. 0 = off (fp32). 1 = bfloat16 autocast (no GradScaler needed, safer for attention). 2 = float16 autocast + GradScaler (faster but tighter dynamic range). Recommended value on Ampere+ GPUs: 1.')
     parser.add_argument('--gpu_id', type=int, default=0, help='primary gpu id, will be overwritten when use_multi_gpu is 1. Originally named as --gpu.')
     parser.add_argument('--gpu_ids', type=str, default=None, help='string of device ids for multile gpus. Originally named as --devices. WARNING: not thoroughly tested yet. Currently, setting --use_multi_gpu 1 is enough.')
     parser.add_argument('--use_gpu', type=int, default=1, help='Whether to use gpu.')

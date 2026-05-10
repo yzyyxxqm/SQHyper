@@ -178,7 +178,9 @@ class SpikeRefractoryIncidence(nn.Module):
     def forward(self, obs: Tensor, mask_flat: Tensor,
                 variable_incidence_matrix: Tensor,
                 variable_indices_flattened: Tensor,
-                time_norm: Tensor):
+                time_norm: Tensor,
+                refractory_mask_bool: Tensor = None,
+                time_diff_clamped: Tensor = None):
         """
         Args:
             obs: (B, N, D) observation node embeddings
@@ -186,6 +188,12 @@ class SpikeRefractoryIncidence(nn.Module):
             variable_incidence_matrix: (B, E, N)
             variable_indices_flattened: (B, N) long
             time_norm: (B, N) in [0, 1]
+            refractory_mask_bool: (B, N, N) bool, precomputed once per forward
+                via Model.forward. same_var & earlier & valid_pair. If None
+                it will be computed locally (slow path for callers that did
+                not precompute).
+            time_diff_clamped: (B, N, N) float, = (t_n - t_m).clamp_min(0).
+                Also precomputed per forward. If None, computed locally.
         Returns:
             g_n: (B, N) spike gate in (0, 1], masked
             e_n: (B, N, D/4) event features (gated by g_n), masked
@@ -211,25 +219,34 @@ class SpikeRefractoryIncidence(nn.Module):
         tau = torch.exp(self.log_tau)[variable_indices_flattened]
         alpha = torch.exp(self.log_alpha)[variable_indices_flattened]  # (B, N)
 
-        # Pair masks: same variable, earlier time, both observed.
-        same_var = (
-            variable_indices_flattened.unsqueeze(2)
-            == variable_indices_flattened.unsqueeze(1)
-        )
-        time_diff = time_norm.unsqueeze(2) - time_norm.unsqueeze(1)  # t_n - t_m
-        earlier = (time_diff > 0).to(obs.dtype)  # m before n
-        valid_pair = (
-            mask_flat.unsqueeze(2) * mask_flat.unsqueeze(1))  # both observed
-        pair_mask = same_var.float() * earlier * valid_pair  # (B, N, N)
+        # Pair masks precomputed once per Model.forward and shared across all
+        # SRI layers (they do not depend on learnable parameters). Fall back
+        # to local computation if caller did not provide them.
+        if refractory_mask_bool is None or time_diff_clamped is None:
+            same_var = (
+                variable_indices_flattened.unsqueeze(2)
+                == variable_indices_flattened.unsqueeze(1)
+            )
+            td = time_norm.unsqueeze(2) - time_norm.unsqueeze(1)
+            earlier_bool = td > 0
+            valid_pair_bool = (
+                mask_flat.unsqueeze(2).bool()
+                & mask_flat.unsqueeze(1).bool())
+            refractory_mask_bool = same_var & earlier_bool & valid_pair_bool
+            time_diff_clamped = td.clamp_min(0)
 
-        # Decay kernel exp(-(t_n - t_m) / tau[v_n]). tau[v_n] is per
-        # receiving cell (row n).
-        decay = torch.exp(
-            -time_diff.clamp_min(0) / tau.unsqueeze(2).clamp_min(1e-6))
-        # Sum over m: inhibition input uses raw spike s_m
-        inh = (pair_mask * decay * g_raw.unsqueeze(1)).sum(dim=-1)  # (B, N)
+        # Decay kernel exp(-(t_n - t_m) / tau[v_n]) gated by refractory mask
+        # and weighted by source spike s_m. Using a single masked_fill +
+        # single fused mul avoids materializing 5 separate (B, N, N) float
+        # intermediates as in the original implementation.
+        tau_row = tau.unsqueeze(2).clamp_min(1e-6)  # (B, N, 1)
+        decay = torch.exp(-time_diff_clamped / tau_row)  # (B, N, N)
+        # weight = mask * decay * g_raw_m (source-cell spike)
+        weighted = decay * g_raw.unsqueeze(1)
+        weighted = weighted.masked_fill(~refractory_mask_bool, 0.0)
+        inh = weighted.sum(dim=-1)  # (B, N)
         g_refr = 1.0 - torch.tanh(alpha * inh)  # in (0, 1]
-        g_n = g_raw * g_refr  # masked by g_raw via g_raw * mask
+        g_n = g_raw * g_refr
 
         # Also dampen event features by refractory factor
         e_n = e_n * g_refr.unsqueeze(-1)
@@ -493,7 +510,8 @@ class HypergraphLearner(nn.Module):
                 time_indices_flattened, variable_indices_flattened,
                 temporal_incidence_matrix, variable_incidence_matrix,
                 x_y_mask_flattened, x_y_mask, y_mask_L_flattened,
-                time_norm):
+                time_norm,
+                refractory_mask_bool=None, time_diff_clamped=None):
         D = self.d_model
         Q = D // 4
 
@@ -505,10 +523,14 @@ class HypergraphLearner(nn.Module):
                 mask_temp[mask_temp == 0] = 1e-8
 
             # --------- Step 1: SRI — Spike-Refractory Incidence ---------
+            # Shared pair tensors are computed once in Model.forward and
+            # passed here to avoid duplicating O(B*N^2) work per layer.
             g_n, e_n = self.sri[i](
                 observation_nodes, x_y_mask_flattened,
                 variable_incidence_matrix, variable_indices_flattened,
-                time_norm)
+                time_norm,
+                refractory_mask_bool=refractory_mask_bool,
+                time_diff_clamped=time_diff_clamped)
 
             # --------- Step 1.5: SQC — spike-driven rotation ---------
             # Rotate observation_nodes by theta proportional to spike before
@@ -759,6 +781,26 @@ class Model(nn.Module):
         # Normalized time for SRI refractory kernel
         time_norm = time_indices_flattened.float() / max(1, L - 1)
 
+        # -------- Precompute SRI pair tensors (shared across all layers) --------
+        # same_var, earlier, valid_pair and time_diff only depend on data and
+        # masks, not on learnable parameters, so they are identical across
+        # every HypergraphLearner layer's SRI. Computing them once here saves
+        # (n_layers-1) * O(B*N^2) work and memory versus the original per-layer
+        # recomputation.
+        refractory_mask_bool = None
+        time_diff_clamped = None
+        learner = self.hypergraph_learner
+        if not getattr(learner, "no_sri", False):
+            var_idx = variable_indices_flattened
+            same_var_b = var_idx.unsqueeze(2) == var_idx.unsqueeze(1)
+            td = time_norm.unsqueeze(2) - time_norm.unsqueeze(1)
+            earlier_b = td > 0
+            valid_b = (
+                x_y_mask_flattened.unsqueeze(2).bool()
+                & x_y_mask_flattened.unsqueeze(1).bool())
+            refractory_mask_bool = same_var_b & earlier_b & valid_b
+            time_diff_clamped = td.clamp_min(0)
+
         # Encode
         (observation_nodes, temporal_hyperedges, variable_hyperedges,
          temporal_incidence_matrix, variable_incidence_matrix
@@ -774,7 +816,9 @@ class Model(nn.Module):
             time_indices_flattened, variable_indices_flattened,
             temporal_incidence_matrix, variable_incidence_matrix,
             x_y_mask_flattened, x_y_mask, y_mask_L_flattened,
-            time_norm)
+            time_norm,
+            refractory_mask_bool=refractory_mask_bool,
+            time_diff_clamped=time_diff_clamped)
 
         # Decode (same as SQHyper)
         if self.configs.task_name in [

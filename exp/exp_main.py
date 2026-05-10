@@ -1,4 +1,5 @@
 # Code from: https://github.com/Ladbaby/PyOmniTS
+import contextlib
 import datetime
 import importlib
 import json
@@ -47,6 +48,27 @@ class Exp_Main(Exp_Basic):
         - self.device
         '''
         super(Exp_Main, self).__init__(configs)
+        # Automatic mixed precision (AMP) setup.
+        #   use_amp == 0 -> fp32 training (default)
+        #   use_amp == 1 -> bfloat16 autocast, no GradScaler (Ampere+ only)
+        #   use_amp == 2 -> float16 autocast + GradScaler
+        amp_mode = int(getattr(self.configs, "use_amp", 0))
+        self._amp_mode = amp_mode
+        if amp_mode == 1:
+            self._amp_dtype = torch.bfloat16
+            self._amp_scaler = None
+        elif amp_mode == 2:
+            self._amp_dtype = torch.float16
+            self._amp_scaler = torch.cuda.amp.GradScaler()
+        else:
+            self._amp_dtype = None
+            self._amp_scaler = None
+        if amp_mode:
+            logger.info(
+                f"AMP enabled: mode={amp_mode} "
+                f"(dtype={self._amp_dtype}, "
+                f"use_grad_scaler={self._amp_scaler is not None})"
+            )
 
     def _build_model(self) -> Module:
         # dynamically import the desired model class
@@ -353,6 +375,13 @@ class Exp_Main(Exp_Basic):
     ) -> np.ndarray:
         total_loss = []
         model_train.eval()
+        # Autocast during validation gives memory/speed win without affecting
+        # gradient scaling (we're under no_grad). Uses same dtype as training.
+        def _amp_ctx():
+            if self._amp_mode > 0:
+                return torch.autocast(device_type='cuda',
+                                       dtype=self._amp_dtype)
+            return contextlib.nullcontext()
         with torch.no_grad():
             with tqdm(total=len(vali_loader), leave=False, desc="Validating") as it:
                 batch: dict[str, Tensor] # type hints
@@ -368,21 +397,22 @@ class Exp_Main(Exp_Basic):
                     if not self.configs.use_multi_gpu:
                         batch = {k: v.to(self.device) for k, v in batch.items()}
 
-                    # some model's forward function return different values in "train", "val", "test", they can use `exp_stage` as argument to distinguish
-                    outputs: dict[str, Tensor] = model_train(
-                        **batch,
-                        exp_stage="val",
-                        train_stage=train_stage,
-                        current_epoch=current_epoch
-                    )
+                    with _amp_ctx():
+                        # some model's forward function return different values in "train", "val", "test", they can use `exp_stage` as argument to distinguish
+                        outputs: dict[str, Tensor] = model_train(
+                            **batch,
+                            exp_stage="val",
+                            train_stage=train_stage,
+                            current_epoch=current_epoch
+                        )
 
-                    loss: Tensor = criterion(
-                        **outputs,
-                        exp_stage="val",
-                        train_stage=train_stage,
-                        current_epoch=current_epoch,
-                        model=model_train
-                    )["loss"]
+                        loss: Tensor = criterion(
+                            **outputs,
+                            exp_stage="val",
+                            train_stage=train_stage,
+                            current_epoch=current_epoch,
+                            model=model_train
+                        )["loss"]
                     total_loss.append(loss.item())
 
                     if accelerator.is_main_process:
@@ -448,24 +478,32 @@ class Exp_Main(Exp_Basic):
                         if not self.configs.use_multi_gpu:
                             batch = {k: v.to(self.device) for k, v in batch.items()}
 
-                        outputs: dict[str, Tensor] = model_train(
-                            **batch,
-                            exp_stage="train",
-                            train_stage=train_stage,
-                            current_epoch=epoch
-                        )
+                        # AMP autocast: run forward + criterion under bf16/fp16
+                        # when --use_amp != 0; falls back to fp32 otherwise.
+                        if self._amp_mode > 0:
+                            _ctx = torch.autocast(
+                                device_type='cuda', dtype=self._amp_dtype)
+                        else:
+                            _ctx = contextlib.nullcontext()
+                        with _ctx:
+                            outputs: dict[str, Tensor] = model_train(
+                                **batch,
+                                exp_stage="train",
+                                train_stage=train_stage,
+                                current_epoch=epoch
+                            )
 
-                        # check model's outputs only in the first iteration
-                        if i == 0 and epoch == 0:
-                            self._check_model_outputs(batch, outputs)
-                        
-                        loss: Tensor = criterion(
-                            **outputs,
-                            exp_stage="train",
-                            train_stage=train_stage,
-                            current_epoch=epoch,
-                            model=model_train
-                        )["loss"]
+                            # check model's outputs only in the first iteration
+                            if i == 0 and epoch == 0:
+                                self._check_model_outputs(batch, outputs)
+
+                            loss: Tensor = criterion(
+                                **outputs,
+                                exp_stage="train",
+                                train_stage=train_stage,
+                                current_epoch=epoch,
+                                model=model_train
+                            )["loss"]
 
                         # check loss
                         if torch.any(torch.isnan(loss)):

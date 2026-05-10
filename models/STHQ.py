@@ -1,428 +1,552 @@
-# STHQ-Net: Spike-Triggered Hyperedge with Quaternion States
+# STHQ v7: Spike-Triggered Hypergraph with Quaternion fusion (SQHyper backbone)
 #
-# A native hypergraph model for IMTS forecasting where:
-#   - SPIKE intensity directly multiplies hyperedge membership weights
-#     (cells with low spike intensity contribute proportionally less)
-#   - QUATERNION represents typed cell state with 4 components:
-#       q_r = value channel
-#       q_i = temporal channel
-#       q_j = variable channel
-#       q_k = spike-driven hidden channel
-#     Hamilton product (Kronecker-form) composes hyperedge with cell state
-#   - HYPERGRAPH has two emergent edge types:
-#       Temporal hyperedges: K_t soft Gaussian time-windows (τ_k, ω_k learned)
-#       Variable hyperedges: V × K_v learnable affinity matrix
+# Diagnostic finding from v5/v6:
+#   STHQ (v1-v6) replaced HyperIMTS's HARD per-timestep temporal hyperedges
+#   with SOFT learnable K_t Gaussian anchors. On long irregular series this
+#   caused 5x regression vs SQHyper (HA: 0.092 vs 0.0173). Per-timestep
+#   coupling between cells was destroyed, and there was no cell-to-cell
+#   attention to compensate.
 #
-# Key differences from PE-RQH/SC-PERQH/HyperIMTS:
-#   - No codebook bottleneck: cells -> hyperedges -> cells through compositional
-#     Hamilton product, not lossy code-routing
-#   - Hyperedges have analytic membership (Gaussian + softmax), not VQ
-#   - Each layer uses a different ω_k range (multi-scale temporal hyperedges)
-#   - Spike is the multiplicative core of membership weights, not a side-gate
+# v7 commitment:
+#   1. RECOVER the SQHyper backbone:
+#        - L hard temporal hyperedges (one per timestep)
+#        - enc_in hard variable hyperedges (one per variable)
+#        - Hard 0/1 incidence matrices (NOT Gaussian kernels)
+#        - node_self_update: full cell-to-cell attention (3D MHA)
+#        - QMF: Quaternion Multi-Source Fusion for hyperedge -> node
+#        - IrregularityAwareAttention for variable-hyperedge co-update
 #
-# Hyperparameters:
-#   d_model           : 4Q (must be divisible by 4)
-#   n_layers          : number of STHQ layers (default 3)
-#   sthq_k_t          : K_t per layer (number of temporal hyperedges)
-#   sthq_k_v          : K_v per layer (number of variable hyperedges)
-#   sthq_omega_min    : min temporal bandwidth (relative to seq_len)
-#   sthq_omega_max    : max temporal bandwidth
-#   sthq_use_he_attn_from_layer : layer index from which to apply hyperedge
-#                                  self-attention (set to n_layers to disable)
+#   2. STHQ-distinct contribution: stronger spike encoder
+#        - Multi-feature input: (value, time, mask, var_emb)  vs SGI's
+#          (obs, deviation). Captures temporal phase + variable identity
+#          without relying on the hypergraph structure to bootstrap.
+#        - Spike floor: every observed cell contributes >= floor mass to
+#          K/V gating. Prevents "spike starvation" on sparse medical data
+#          (P12, MIMIC) where the encoder otherwise collapses to ~0.
+#        - Produces both:
+#            g_n: scalar gate (B, N) for K/V gating in n2h attention
+#            e_n: D/4 event features for the K-component of QMF
+#
+#   3. Removed (proven not to help):
+#        - K_t/K_v soft hyperedges (replaced by L/enc_in hard)
+#        - Hamilton/Linear hybrid (alpha) — both paths equivalent
+#        - STEA dynamic event anchors (beta) — redundant with L hyperedges
+#        - Spike-modulated bandwidth (gamma) — no kernel to modulate
+#        - tau-repulsion / var-entropy aux losses (no anchors to regularize)
+#
+# Key STHQ-distinct hyperparameters:
+#   --sthq_spike_floor      : minimum K/V gating weight on observed cells
+#   --sthq_event_layer_warmup: number of layers where e_n is zeroed (warmup)
+#   --sthq_no_quaternion    : ablation flag (replace QMF with linear h2n)
+#   --sthq_no_spike         : ablation flag (replace spike encoder with mask)
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import repeat
+from einops import repeat, rearrange
+from torch import Tensor
 from utils.ExpConfigs import ExpConfigs
 from utils.globals import logger
 
 
 # ============================================================================
-# Quaternion primitives (Kronecker formulation)
+# Quaternion Linear (Hamilton-product structured transform)
 # ============================================================================
 
-# Basis matrices for the 4x4 Hamilton structure constants.
-# These constants implement the Hamilton product map M(p):
-#   for p = (p_r, p_i, p_j, p_k), M(p) acts on q = (q_r, q_i, q_j, q_k)^T as
-#   p ⊗ q.
-# Equivalently, the QuaternionLinear weight matrix W of size (4Q, 4Q) is
-#   W = A_1 ⊗ R + A_i ⊗ I + A_j ⊗ J + A_k ⊗ K
-# where R, I, J, K are Q×Q learnable matrices.
-_BASIS_A1 = torch.tensor([
-    [1.0, 0.0, 0.0, 0.0],
-    [0.0, 1.0, 0.0, 0.0],
-    [0.0, 0.0, 1.0, 0.0],
-    [0.0, 0.0, 0.0, 1.0],
-])
-_BASIS_AI = torch.tensor([
-    [0.0, -1.0, 0.0, 0.0],
-    [1.0,  0.0, 0.0, 0.0],
-    [0.0,  0.0, 0.0, -1.0],
-    [0.0,  0.0, 1.0, 0.0],
-])
-_BASIS_AJ = torch.tensor([
-    [0.0, 0.0, -1.0, 0.0],
-    [0.0, 0.0,  0.0, 1.0],
-    [1.0, 0.0,  0.0, 0.0],
-    [0.0, -1.0, 0.0, 0.0],
-])
-_BASIS_AK = torch.tensor([
-    [0.0,  0.0, 0.0, -1.0],
-    [0.0,  0.0, -1.0, 0.0],
-    [0.0,  1.0, 0.0,  0.0],
-    [1.0,  0.0, 0.0,  0.0],
-])
-
-
 class QuaternionLinear(nn.Module):
-    """Learnable quaternion-structured linear layer using Kronecker product.
+    """Hamilton-product structured linear layer.
 
-    For input/output dim 4Q, parameter count is 4 * Q * Q (1/4 of flat Linear).
+    For input/output dim 4Q, parameter count is 4 * Q * Q (1/4 of flat
+    Linear). Implements W in block form with cross-component coupling that
+    matches the algebra of quaternion multiplication.
     """
+
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
-        assert in_features % 4 == 0 and out_features % 4 == 0
-        self.q_in = in_features // 4
-        self.q_out = out_features // 4
-        self.R = nn.Parameter(torch.empty(self.q_out, self.q_in))
-        self.I = nn.Parameter(torch.empty(self.q_out, self.q_in))
-        self.J = nn.Parameter(torch.empty(self.q_out, self.q_in))
-        self.K = nn.Parameter(torch.empty(self.q_out, self.q_in))
-        for p in (self.R, self.I, self.J, self.K):
-            nn.init.xavier_uniform_(p, gain=0.5)
+        assert in_features % 4 == 0 and out_features % 4 == 0, (
+            f"QuaternionLinear requires dims divisible by 4, "
+            f"got {in_features}, {out_features}"
+        )
+        qi, qo = in_features // 4, out_features // 4
+        self.r = nn.Parameter(torch.empty(qo, qi))
+        self.i = nn.Parameter(torch.empty(qo, qi))
+        self.j = nn.Parameter(torch.empty(qo, qi))
+        self.k = nn.Parameter(torch.empty(qo, qi))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
-        # register basis as buffers (so .to(device) works automatically)
-        self.register_buffer("_A1", _BASIS_A1.clone(), persistent=False)
-        self.register_buffer("_AI", _BASIS_AI.clone(), persistent=False)
-        self.register_buffer("_AJ", _BASIS_AJ.clone(), persistent=False)
-        self.register_buffer("_AK", _BASIS_AK.clone(), persistent=False)
+
+    def init_identity(self):
+        nn.init.eye_(self.r)
+        nn.init.zeros_(self.i)
+        nn.init.zeros_(self.j)
+        nn.init.zeros_(self.k)
+
+    def init_xavier(self):
+        for p in (self.r, self.i, self.j, self.k):
+            nn.init.xavier_uniform_(p)
 
     def forward(self, x):
-        W = (
-            torch.kron(self._A1, self.R)
-            + torch.kron(self._AI, self.I)
-            + torch.kron(self._AJ, self.J)
-            + torch.kron(self._AK, self.K)
-        )
+        r, i, j, k = self.r, self.i, self.j, self.k
+        W = torch.cat([
+            torch.cat([r, -i, -j, -k], 1),
+            torch.cat([i,  r, -k,  j], 1),
+            torch.cat([j,  k,  r, -i], 1),
+            torch.cat([k, -j,  i,  r], 1),
+        ], 0)
         return F.linear(x, W, self.bias)
 
 
-def hamilton_product(p, q):
-    """Hamilton product of two quaternion-structured tensors.
-
-    p, q: shape [..., 4Q]
-    Returns: shape [..., 4Q]
-
-    Implemented as cross-component combinations of the 4 split parts
-    (mathematically equivalent to (M(p) @ q.unsqueeze(-1)).squeeze(-1) on
-    the per-Q-block components).
-    """
-    Q = p.shape[-1] // 4
-    pr, pi, pj, pk = p[..., :Q], p[..., Q:2*Q], p[..., 2*Q:3*Q], p[..., 3*Q:]
-    qr, qi, qj, qk = q[..., :Q], q[..., Q:2*Q], q[..., 2*Q:3*Q], q[..., 3*Q:]
-    out_r = pr*qr - pi*qi - pj*qj - pk*qk
-    out_i = pr*qi + pi*qr + pj*qk - pk*qj
-    out_j = pr*qj - pi*qk + pj*qr + pk*qi
-    out_k = pr*qk + pi*qj - pj*qi + pk*qr
-    return torch.cat([out_r, out_i, out_j, out_k], dim=-1)
-
-
-class QuaternionLayerNorm(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-        assert d_model % 4 == 0
-        self.Q = d_model // 4
-        self.ln_r = nn.LayerNorm(self.Q)
-        self.ln_i = nn.LayerNorm(self.Q)
-        self.ln_j = nn.LayerNorm(self.Q)
-        self.ln_k = nn.LayerNorm(self.Q)
-
-    def forward(self, x):
-        Q = self.Q
-        return torch.cat([
-            self.ln_r(x[..., :Q]),
-            self.ln_i(x[..., Q:2*Q]),
-            self.ln_j(x[..., 2*Q:3*Q]),
-            self.ln_k(x[..., 3*Q:]),
-        ], dim=-1)
-
-
 # ============================================================================
-# Spike Encoder: produces salience intensity ∈ [0, 1] per cell
+# Stronger Spike Encoder (STHQ-distinct)
+#
+# Replaces SQHyper's SGI module. Two key improvements:
+#   1. Multi-feature input: (value, time_norm, mask, var_emb) — captures
+#      temporal phase + variable identity intrinsically rather than via
+#      hypergraph context (which is unreliable at layer 0).
+#   2. Spike floor: g_n = floor + (1-floor) * sigmoid(MLP). Guarantees
+#      every observed cell contributes >= floor mass to attention K/V.
+#      Critical on sparse medical data where MLP otherwise outputs ~0.
 # ============================================================================
 
 class SpikeEncoder(nn.Module):
-    """1-layer MLP + sigmoid; gated by mask so missing cells have spike=0.
-
-    Soft floor (≥0) ensures every observed cell contributes at least `floor`
-    mass to hyperedge formation, preventing the "spike starvation" failure
-    mode observed on sparse datasets (P12: 3% active, MIMIC: 12% active).
-    """
-    def __init__(self, n_vars, hidden, floor=0.0):
+    def __init__(self, n_vars, d_model, hidden=None, floor=0.0):
         super().__init__()
-        self.var_emb = nn.Embedding(n_vars, hidden)
+        H = hidden if hidden is not None else max(16, d_model // 4)
+        self.var_emb = nn.Embedding(n_vars, H)
         nn.init.normal_(self.var_emb.weight, std=0.1)
-        self.proj = nn.Linear(3 + hidden, 1)
-        nn.init.zeros_(self.proj.bias)
+        # Encoder body: shared between gate head and event head
+        self.body = nn.Sequential(
+            nn.Linear(3 + H, H),
+            nn.GELU(),
+            nn.Linear(H, H),
+        )
+        # Gate head -> scalar in [floor, 1]
+        self.gate_head = nn.Linear(H, 1)
+        # Initialize gate near 1.0 (sigmoid(2) ~ 0.88) so layer 0 starts
+        # close to mask-only gating, then learns to specialize.
+        nn.init.zeros_(self.gate_head.weight)
+        nn.init.constant_(self.gate_head.bias, 2.0)
+        # Event head -> D/4 features (used as q_K in QMF)
+        # Init to zero so event signal starts off and is learned in.
+        Q = d_model // 4
+        self.event_head = nn.Linear(H, Q)
+        nn.init.zeros_(self.event_head.weight)
+        nn.init.zeros_(self.event_head.bias)
         self.floor = float(floor)
 
     def forward(self, value, time_norm, mask, var_id):
-        ve = self.var_emb(var_id)                            # [B,N,hidden]
+        """
+        value     : [B, N]
+        time_norm : [B, N]   in [0, 1]
+        mask      : [B, N]   1 for observed (incl. forecast queries)
+        var_id    : [B, N]
+        Returns:
+            g_n : [B, N]      gate in [floor, 1] on observed cells, 0 elsewhere
+            e_n : [B, N, D/4] event features (gated by g_n and mask)
+        """
+        ve = self.var_emb(var_id)
         feats = torch.cat([
             (value * mask).unsqueeze(-1),
             time_norm.unsqueeze(-1),
             mask.unsqueeze(-1),
             ve,
         ], dim=-1)
-        # Spike with floor: every observed cell contributes at least `floor`
-        # mass to hyperedge formation, preventing starvation on sparse
-        # (medical) datasets where the encoder otherwise outputs ~0.
-        # floor=0 → original sigmoid; floor>0 → soft floor in [floor, 1].
-        s_raw = torch.sigmoid(self.proj(feats).squeeze(-1))
-        s = self.floor + (1.0 - self.floor) * s_raw
-        return s * mask                                       # gate by mask
+        h = self.body(feats)                              # [B, N, H]
+        g_raw = torch.sigmoid(self.gate_head(h).squeeze(-1))
+        g_n = (self.floor + (1.0 - self.floor) * g_raw) * mask
+        e_n = self.event_head(h) * g_n.unsqueeze(-1) * mask.unsqueeze(-1)
+        return g_n, e_n
 
 
 # ============================================================================
-# Quaternion State Encoder: 4 typed components per cell
+# Multi-Head Attention Block (from HyperIMTS / SQHyper, identical)
 # ============================================================================
 
-class CellEncoder(nn.Module):
-    def __init__(self, d_model, n_vars):
+class MultiHeadAttentionBlock(nn.Module):
+    """Standard masked multi-head attention with residual + ReLU FFN.
+
+    Used for n2h (node -> hyperedge) and h2n self-update across cells.
+    """
+
+    def __init__(self, dim_Q, dim_K, dim_V, n_dim, num_heads, ln=False):
         super().__init__()
-        assert d_model % 4 == 0
-        self.Q = d_model // 4
-        self.value_proj = nn.Linear(2, self.Q)               # (value*mask, mask) -> r
-        freqs = torch.exp(torch.linspace(0.0, math.log(50.0), self.Q))
-        self.time_freq = nn.Parameter(freqs)                  # learnable freqs
-        self.var_emb_j = nn.Embedding(n_vars, self.Q)        # j-component
-        nn.init.normal_(self.var_emb_j.weight, std=0.1)
-        self.spike_proj = nn.Linear(1, self.Q)                # spike-driven k
-        self.mix = QuaternionLinear(d_model, d_model)
+        self.num_heads = num_heads
+        self.n_dim = n_dim
+        self.fc_q = nn.Linear(dim_Q, n_dim)
+        self.fc_k = nn.Linear(dim_K, n_dim)
+        self.fc_v = nn.Linear(dim_K, n_dim)
+        if ln:
+            self.ln0 = nn.LayerNorm(dim_V)
+            self.ln1 = nn.LayerNorm(dim_V)
+        self.fc_o = nn.Linear(n_dim, n_dim)
 
-    def forward(self, value, time_norm, var_id, spike_intensity, mask):
-        v_input = torch.stack([value * mask, mask], dim=-1)
-        q_r = self.value_proj(v_input)
-        t_phase = time_norm.unsqueeze(-1) * self.time_freq
-        q_i = torch.sin(t_phase)
-        q_j = self.var_emb_j(var_id)
-        q_k = self.spike_proj(spike_intensity.unsqueeze(-1))
-        q = torch.cat([q_r, q_i, q_j, q_k], dim=-1)
-        return self.mix(q) * mask.unsqueeze(-1)
+    def forward(self, Q, K, mask=None):
+        Q = self.fc_q(Q)
+        K_, V = self.fc_k(K), self.fc_v(K)
+        ds = self.n_dim // self.num_heads
+        Q_ = torch.cat(Q.split(ds, 2), 0)
+        K_ = torch.cat(K_.split(ds, 2), 0)
+        V = torch.cat(V.split(ds, 2), 0)
+        A = Q_.bmm(K_.transpose(1, 2)) / math.sqrt(self.n_dim)
+        if mask is not None:
+            A = A.masked_fill(mask.repeat(self.num_heads, 1, 1) == 0, -1e9)
+        A = torch.softmax(A, 2)
+        O = torch.cat((Q_ + A.bmm(V)).split(Q.size(0), 0), 2)
+        O = O if getattr(self, "ln0", None) is None else self.ln0(O)
+        O = O + F.relu(self.fc_o(O))
+        O = O if getattr(self, "ln1", None) is None else self.ln1(O)
+        return O
 
 
 # ============================================================================
-# STHQ Layer: cells -> hyperedges -> cells via spike-gated membership and
-# Hamilton-product composition.
+# Irregularity-Aware Attention (from HyperIMTS, used in last layer h2h)
 # ============================================================================
 
-class STHQLayer(nn.Module):
-    def __init__(self, d_model, n_vars, k_t, k_v,
-                 omega_min, omega_max, layer_idx, n_layers,
-                 use_he_attn=False, k_e=0):
+class IrregularityAwareAttention(nn.Module):
+    def __init__(self, d_model):
         super().__init__()
+        self.query_proj = nn.Linear(d_model, d_model)
+        self.key_proj = nn.Linear(d_model, d_model)
+        self.value_proj = nn.Linear(d_model, d_model)
+        self.scale = d_model ** 0.5
+        self.threshold = nn.Parameter(torch.tensor(0.5), requires_grad=True)
+
+    def forward(self, x, query_aux=None, key_aux=None,
+                adjacency_mask=None, merge_coefficients=None):
+        B, V, D = x.shape
+        query = self.query_proj(x)
+        key = self.key_proj(x)
+        value = self.value_proj(x)
+        att = torch.matmul(query, key.transpose(-2, -1)) / self.scale
+        mask_val = torch.finfo(att.dtype).min
+        if query_aux is not None and key_aux is not None:
+            att_aux = torch.matmul(query_aux, key_aux.transpose(-2, -1)) / (
+                key_aux.shape[-1] ** 0.5)
+            non_zero = (att_aux != 0)
+            positive = (att > self.threshold)
+            mask = positive & non_zero
+            att[mask] = (
+                (1 - merge_coefficients) * att
+                + merge_coefficients * att_aux
+            )[mask]
+        if adjacency_mask is not None:
+            att = att.masked_fill(adjacency_mask == 0, mask_val)
+        attn = torch.softmax(att, dim=-1)
+        return torch.matmul(attn, value)
+
+
+# ============================================================================
+# Hypergraph Encoder: cells -> nodes + hard hyperedges with binary incidence
+# (Identical to HyperIMTS / SQHyper structure)
+# ============================================================================
+
+class HypergraphEncoder(nn.Module):
+    def __init__(self, enc_in, time_length, d_model):
+        super().__init__()
+        self.enc_in = enc_in
         self.d_model = d_model
-        self.k_t = k_t
-        self.k_v = k_v
-        self.k_e = int(k_e)
-        self.layer_idx = layer_idx
-        self.use_he_attn = use_he_attn
+        self.variable_hyperedge_weights = nn.Parameter(
+            torch.randn(enc_in, d_model), requires_grad=True)
+        self.relu = nn.ReLU()
+        self.observation_node_encoder = nn.Linear(2, d_model)
+        self.temporal_hyperedge_encoder = nn.Linear(1, d_model)
 
-        # Layer-specific bandwidth range (multi-scale across layers)
-        if n_layers > 1:
-            log_min = math.log(omega_min)
-            log_max = math.log(omega_max)
-            t_layer = layer_idx / (n_layers - 1)
-            this_log_center = log_min + t_layer * (log_max - log_min)
-        else:
-            this_log_center = 0.5 * (math.log(omega_min) + math.log(omega_max))
-        # τ initialized uniformly in [0, 1]; τ are learnable
-        tau_init = torch.linspace(0.0, 1.0, k_t)
-        self.tau = nn.Parameter(tau_init)
-        # ω initialized to layer-specific value, learnable
-        omega_init = torch.full((k_t,), math.exp(this_log_center))
-        self.omega_log = nn.Parameter(torch.log(omega_init))
+    def forward(self, x_L_flattened, x_y_mask_flattened, y_mask_L_flattened,
+                x_y_mark, variable_indices_flattened, time_indices_flattened,
+                N_OBSERVATIONS_MAX):
+        B = x_L_flattened.shape[0]
+        E, L, D = self.enc_in, x_y_mark.shape[1], self.d_model
+        N = N_OBSERVATIONS_MAX
 
-        # Variable affinity: V × K_v matrix (logits, softmax over K_v)
-        self.var_affinity = nn.Parameter(torch.zeros(n_vars, k_v))
-        # initialize so that var v has slight preference for code v % k_v
-        with torch.no_grad():
-            for v in range(n_vars):
-                self.var_affinity[v, v % k_v] = 1.0
+        # Concat value with forecast-target indicator (1 for query, 0 for obs)
+        x_L_flattened = torch.stack(
+            [x_L_flattened, 1 - x_y_mask_flattened + y_mask_L_flattened],
+            dim=-1)
 
-        # Per-edge-type projection of hyperedge state (quaternion-aware)
-        self.edge_proj_t = QuaternionLinear(d_model, d_model)
-        self.edge_proj_v = QuaternionLinear(d_model, d_model)
-
-        # Hybrid Hamilton + Linear message paths.
-        #   msg_path_h : Hamilton-composed messages (typed-quaternion product)
-        #   msg_path_l : direct linear messages (no quaternion structure)
-        # Mix via learnable scalar α ∈ [0,1] per-layer.
-        self.msg_proj_h = QuaternionLinear(d_model, d_model)
-        self.msg_proj_l = nn.Linear(d_model, d_model)
-        self.alpha_logit = nn.Parameter(torch.tensor(0.0))  # sigmoid(0)=0.5
-        self.norm = QuaternionLayerNorm(d_model)
-        self.dropout = nn.Dropout(0.1)
-
-        # Spike-modulated bandwidth: ω_eff(cell, anchor) = ω(anchor) * (1 + γ(1-spike))
-        # Cells with high spike → narrow ω (precise temporal focus);
-        # low spike → wide ω (diffuse, gather context). Deepens
-        # spike-trigger story without HyperIMTS overlap.
-        # γ stored as raw param, exp(γ_log) > 0 enforces positivity.
-        self.spike_omega_gamma_log = nn.Parameter(torch.tensor(math.log(1.0)))
-
-        # Optional hyperedge self-attention (deep layers)
-        if use_he_attn:
-            self.he_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
-            self.he_norm = QuaternionLayerNorm(d_model)
-
-        # ---- Spike-Triggered Event Anchors (STEA) ---------------------------
-        # When k_e > 0, the layer additionally constructs k_e DYNAMIC
-        # (per-batch) hyperedges anchored at the top-K spike-active observed
-        # cells. Captures sample-specific burst patterns that static τ
-        # anchors cannot encode. STHQ-distinct: HyperIMTS has no per-sample
-        # learned anchors; this is the "event-routed" mechanism.
-        if self.k_e > 0:
-            # Bandwidth for event kernel (smaller than static τ — events
-            # are localized).
-            self.event_omega_log = nn.Parameter(
-                torch.tensor(math.log(max(omega_min, 0.01))))
-            # How much weight cross-variable receives (1.0 = full,
-            # 0.0 = same-var only)
-            self.event_xvar_softness = nn.Parameter(torch.tensor(0.0))
-            # Quaternion projections for event hyperedge state and message
-            self.event_proj = QuaternionLinear(d_model, d_model)
-            self.event_msg_proj = QuaternionLinear(d_model, d_model)
-            # Mixing weight between (temporal+variable) and event paths
-            self.event_mix_logit = nn.Parameter(torch.tensor(-1.0))
-
-    def forward(self, q, spike_intensity, time_norm, var_id, mask):
-        """
-        q              : [B, N, 4Q]  cell state
-        spike_intensity: [B, N]      salience in [0,1] (zero on query positions)
-        time_norm      : [B, N]      time normalized to [0,1]
-        var_id         : [B, N] long
-        mask           : [B, N]      valid-position mask {0,1} (1 for both
-                                     observations AND forecast queries)
-        Returns: q' [B, N, 4Q]
-
-        Membership matrices (separated to allow query cells to RECEIVE without
-        contributing to hyperedge formation):
-          - m_aggr (with spike): cell -> hyperedge (only observed cells with
-            non-zero spike contribute to forming hyperedges)
-          - m_dist (without spike): hyperedge -> cell (queries also receive
-            messages based purely on their (time, var) coordinates)
-        """
-        B, N, D = q.shape
-        # ---- kernels: position + spike-modulated bandwidth ------------------
-        # ω_eff(cell, anchor) = ω(anchor) · (1 + γ · (1 - spike(cell)))
-        # High-spike cells → narrow ω (precise focus); low-spike (incl. queries)
-        # → wide ω (diffuse reception). γ is per-layer learnable, ≥ 0.
-        omega = torch.exp(self.omega_log).clamp(min=1e-3)         # [K_t]
-        gamma = torch.exp(self.spike_omega_gamma_log).clamp(max=10.0)
-        # Broadcast: [1,1,K_t] * [B,N,1] -> [B,N,K_t]
-        omega_eff = omega.view(1, 1, -1) * (
-            1.0 + gamma * (1.0 - spike_intensity).unsqueeze(-1)
+        # Hard temporal incidence: time_step t connected to cell n iff
+        # time_indices_flattened[b, n] == t.
+        temporal_incidence_matrix = repeat(
+            time_indices_flattened, "B N -> B L N", L=L)
+        temporal_incidence_matrix = (temporal_incidence_matrix == repeat(
+            torch.ones(B, L, device=x_L_flattened.device).cumsum(dim=1),
+            "B L -> B L N", N=N) - 1).float()
+        temporal_incidence_matrix = (
+            temporal_incidence_matrix
+            * repeat(x_y_mask_flattened, "B N -> B L N", L=L)
         )
-        diff = time_norm.unsqueeze(-1) - self.tau.view(1, 1, -1)   # [B, N, K_t]
-        kernel_temp = torch.exp(-0.5 * (diff / omega_eff) ** 2)
-        var_logits = self.var_affinity[var_id]                     # [B, N, K_v]
-        kernel_var = F.softmax(var_logits, dim=-1)
 
-        # ---- aggregation membership (cell -> hyperedge): spike-gated --------
-        m_aggr_t = spike_intensity.unsqueeze(-1) * kernel_temp * mask.unsqueeze(-1)
-        m_aggr_v = spike_intensity.unsqueeze(-1) * kernel_var  * mask.unsqueeze(-1)
+        # Hard variable incidence: variable v connected to cell n iff
+        # variable_indices_flattened[b, n] == v.
+        variable_incidence_matrix = repeat(
+            torch.ones(B, E, device=x_L_flattened.device).cumsum(dim=1) - 1,
+            "B E -> B E N", N=N)
+        variable_incidence_matrix = (variable_incidence_matrix == repeat(
+            variable_indices_flattened, "B N -> B E N", E=E)).float()
+        variable_incidence_matrix = (
+            variable_incidence_matrix
+            * repeat(x_y_mask_flattened, "B N -> B E N", E=E)
+        )
 
-        # ---- distribution membership (hyperedge -> cell): position-only -----
-        # No spike factor — query positions receive messages too.
-        m_dist_t = kernel_temp * mask.unsqueeze(-1)
-        m_dist_v = kernel_var  * mask.unsqueeze(-1)
+        # Node / hyperedge initializations
+        observation_nodes = self.relu(
+            self.observation_node_encoder(x_L_flattened)
+        ) * repeat(x_y_mask_flattened, "B N -> B N D", D=D)
+        temporal_hyperedges = torch.sin(
+            self.temporal_hyperedge_encoder(x_y_mark))
+        variable_hyperedges = self.relu(
+            repeat(self.variable_hyperedge_weights, "E D -> B E D", B=B))
 
-        # ---- aggregate cells -> hyperedges (B, K, D) ------------------------
-        denom_t = m_aggr_t.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        h_temp = (m_aggr_t.transpose(1, 2) @ q) / denom_t.transpose(1, 2)
-        denom_v = m_aggr_v.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        h_var = (m_aggr_v.transpose(1, 2) @ q) / denom_v.transpose(1, 2)
+        return (observation_nodes, temporal_hyperedges, variable_hyperedges,
+                temporal_incidence_matrix, variable_incidence_matrix)
 
-        # Per-edge-type quaternion projection
-        h_temp = self.edge_proj_t(h_temp)
-        h_var = self.edge_proj_v(h_var)
 
-        # ---- optional hyperedge self-attention -------------------------------
-        if self.use_he_attn:
-            H = torch.cat([h_temp, h_var], dim=1)                 # [B, K_t+K_v, D]
-            H_attn, _ = self.he_attn(H, H, H, need_weights=False)
-            H_new = self.he_norm(H + H_attn)
-            h_temp = H_new[:, :self.k_t]
-            h_var = H_new[:, self.k_t:]
+# ============================================================================
+# Hypergraph Learner: SQHyper backbone + STHQ SpikeEncoder + QMF
+# ============================================================================
 
-        # ---- distribute hyperedges -> cells via Hamilton product ------------
-        # Cell-side normalization of distribution weights (rows sum to 1).
-        # Hamilton bilinearity: Σ_k m[i,k] · (h_k ⊗ q[i]) = (Σ_k m[i,k] · h_k) ⊗ q[i]
-        m_dist_t_norm = m_dist_t / m_dist_t.sum(dim=2, keepdim=True).clamp_min(1e-6)
-        m_dist_v_norm = m_dist_v / m_dist_v.sum(dim=2, keepdim=True).clamp_min(1e-6)
-        h_temp_per_cell = m_dist_t_norm @ h_temp                  # [B, N, D]
-        h_var_per_cell = m_dist_v_norm @ h_var
+class HypergraphLearner(nn.Module):
+    """Per-layer message passing.
 
-        # Hybrid message: blend Hamilton-product path with linear path.
-        h_per_cell = h_temp_per_cell + h_var_per_cell
-        msg_h = hamilton_product(h_per_cell, q)        # [B, N, D] Hamilton path
-        msg_l = h_per_cell                             # [B, N, D] linear path
-        alpha = torch.sigmoid(self.alpha_logit)
-        msg = alpha * self.msg_proj_h(msg_h) + (1 - alpha) * self.msg_proj_l(msg_l)
+    Step 1: SpikeEncoder -> (g_n, e_n)
+    Step 2: Node -> Temporal hyperedge      (K/V gated by g_n)
+    Step 3: Node -> Variable hyperedge      (K/V gated by g_n)
+    Step 4: Cell-to-cell self-attention     (node_self_update; full 3D MHA)
+    Step 5: Quaternion Multi-Source Fusion  (q_R=self, q_I=temp, q_J=var, q_K=event)
+    Step 6: (last layer only) Hyperedge -> Hyperedge via IrregularityAware attn
+    """
 
-        # ---- Spike-Triggered Event Anchors (STEA) ---------------------------
-        if self.k_e > 0 and N > 0:
-            # spike used for ranking; queries excluded since spike=0 for them
-            # (and their mask=1 but spike encoder outputs 0 — verified).
-            K_e = min(self.k_e, N)
-            spike_for_rank = spike_intensity * mask  # [B, N]
-            # Top-K_e per batch
-            _, top_idx = spike_for_rank.topk(K_e, dim=1)        # [B, K_e]
-            # Gather event positions and seed states (gradient flows through q)
-            event_t = torch.gather(time_norm, 1, top_idx)        # [B, K_e]
-            event_v = torch.gather(var_id, 1, top_idx)           # [B, K_e]
-            top_idx_d = top_idx.unsqueeze(-1).expand(-1, -1, D)  # [B,K_e,D]
-            event_q = torch.gather(q, 1, top_idx_d)              # [B, K_e, D]
+    def __init__(self, n_layers, d_model, n_heads, time_length, n_vars,
+                 spike_floor=0.0, no_spike=False, no_quaternion=False,
+                 event_layer_warmup=0):
+        super().__init__()
+        self.n_layers = n_layers
+        self.d_model = d_model
+        self.n_vars = n_vars
+        self.no_spike = bool(no_spike)
+        self.no_quaternion = bool(no_quaternion)
+        self.event_layer_warmup = int(event_layer_warmup)
+        self.activation = nn.ReLU()
+        D = d_model
+        Q = D // 4
 
-            # Event temporal kernel (Gaussian)
-            omega_e = torch.exp(self.event_omega_log).clamp(min=1e-3)
-            diff_e = time_norm.unsqueeze(-1) - event_t.unsqueeze(1)  # [B,N,K_e]
-            k_temp_e = torch.exp(-0.5 * (diff_e / omega_e) ** 2)
+        # n2h attention (per layer)
+        self.node2temporal_hyperedge = nn.ModuleList([
+            MultiHeadAttentionBlock(D, 2 * D, 2 * D, D, n_heads)
+            for _ in range(n_layers)
+        ])
+        self.node2variable_hyperedge = nn.ModuleList([
+            MultiHeadAttentionBlock(D, 2 * D, 2 * D, D, n_heads)
+            for _ in range(n_layers)
+        ])
+        # Cross-cell self-attention (per layer, OOM-safe with try/except)
+        self.node_self_update = nn.ModuleList([
+            MultiHeadAttentionBlock(D, 3 * D, 3 * D, D, n_heads)
+            for _ in range(n_layers)
+        ])
+        # Variable-hyperedge co-update (last layer only)
+        self.variable_hyperedge2variable_hyperedge = IrregularityAwareAttention(D)
+        self.hyperedge2hyperedge_layers = [n_layers - 1]
+        self.scale = 1 / time_length
+        self.oom_flag = False
 
-            # Event variable kernel: same-var=1; cross-var weighted by softness
-            same_var = (var_id.unsqueeze(-1) == event_v.unsqueeze(1)).float()
-            xvar_w = torch.sigmoid(self.event_xvar_softness)     # [0,1]
-            k_var_e = same_var + xvar_w * (1.0 - same_var)        # [B,N,K_e]
+        # STHQ-distinct: per-layer stronger SpikeEncoder
+        self.spike = nn.ModuleList([
+            SpikeEncoder(n_vars=n_vars, d_model=D, floor=spike_floor)
+            for _ in range(n_layers)
+        ])
+        # Per-layer learnable K/V gating strength (init 0 = HyperIMTS-equivalent)
+        # Lets the model learn per-layer per-dataset gating intensity.
+        self.gate_scale = nn.ParameterList([
+            nn.Parameter(torch.zeros(1)) for _ in range(n_layers)
+        ])
 
-            kernel_e = k_temp_e * k_var_e
+        # QMF projections (per layer): D -> D/4 for each non-spike component
+        self.proj_R = nn.ModuleList([nn.Linear(D, Q) for _ in range(n_layers)])
+        self.proj_I = nn.ModuleList([nn.Linear(D, Q) for _ in range(n_layers)])
+        self.proj_J = nn.ModuleList([nn.Linear(D, Q) for _ in range(n_layers)])
+        # Quaternion fusion layer
+        self.quat_h2n = nn.ModuleList()
+        for _ in range(n_layers):
+            ql = QuaternionLinear(D, D)
+            ql.init_identity()
+            self.quat_h2n.append(ql)
+        # Linear fallback (used when --sthq_no_quaternion)
+        self.linear_h2n = nn.ModuleList(
+            [nn.Linear(D, D) for _ in range(n_layers)])
 
-            # Aggregation (cell -> event hyperedge): spike-gated
-            m_aggr_e = (spike_intensity.unsqueeze(-1) * kernel_e
-                        * mask.unsqueeze(-1))
-            denom_e = m_aggr_e.sum(dim=1, keepdim=True).clamp_min(1e-6)
-            # Hyperedge state: weighted sum of cell states
-            h_event = m_aggr_e.transpose(1, 2) @ q / denom_e.transpose(1, 2)
-            # Inject seed (event_q) information additively then quaternion mix
-            h_event = self.event_proj(h_event + event_q)
+    def get_fine_grained_embedding(self, tensor_flattened, target_shape):
+        B, L, E = target_shape.shape
+        D = tensor_flattened.shape[-1]
+        nd = max(1, int(D * self.scale))
+        tf = tensor_flattened[:, :, :nd]
+        mask = (target_shape > 0).unsqueeze(-1).expand(-1, -1, -1, nd)
+        result = torch.zeros(B, L, E, nd, dtype=tf.dtype, device=tf.device)
+        result.masked_scatter_(mask, tf)
+        return rearrange(result, "B L E D -> B E (L D)")
 
-            # Distribution (event hyperedge -> cell): position-only
-            m_dist_e = kernel_e * mask.unsqueeze(-1)
-            m_dist_e_norm = m_dist_e / m_dist_e.sum(
-                dim=2, keepdim=True).clamp_min(1e-6)
-            h_event_per_cell = m_dist_e_norm @ h_event           # [B,N,D]
-            msg_e = self.event_msg_proj(
-                hamilton_product(h_event_per_cell, q))
+    def forward(self, observation_nodes, temporal_hyperedges, variable_hyperedges,
+                time_indices_flattened, variable_indices_flattened,
+                temporal_incidence_matrix, variable_incidence_matrix,
+                x_y_mask_flattened, x_y_mask, y_mask_L_flattened,
+                value_flattened, time_norm_flattened):
+        D = self.d_model
+        Q = D // 4
+        diag_records = []
 
-            # Blend STEA into total message via learnable mixing weight
-            beta = torch.sigmoid(self.event_mix_logit)            # [0,1]
-            msg = (1 - beta) * msg + beta * msg_e
+        for i in range(self.n_layers):
+            # Layer-0 contribute mask: cells that are forecast targets must
+            # not contribute their (zero) values to any hyperedge they form.
+            if i == 0:
+                mask_temp_t = 1 - repeat(
+                    y_mask_L_flattened, "B N -> B L N",
+                    L=temporal_incidence_matrix.shape[1])
+                mask_temp_t[mask_temp_t == 0] = 1e-8
+                mask_temp_v = 1 - repeat(
+                    y_mask_L_flattened, "B N -> B E N",
+                    E=variable_incidence_matrix.shape[1])
+                mask_temp_v[mask_temp_v == 0] = 1e-8
 
-        msg = self.dropout(msg)
-        q_new = self.norm(q + msg)
-        return q_new * mask.unsqueeze(-1)
+            # ----------------------------------------------------------------
+            # Step 1: STHQ SpikeEncoder -> (g_n, e_n)
+            # ----------------------------------------------------------------
+            if not self.no_spike:
+                g_n, e_n = self.spike[i](
+                    value=value_flattened,
+                    time_norm=time_norm_flattened,
+                    mask=x_y_mask_flattened,
+                    var_id=variable_indices_flattened,
+                )
+                # K/V gating: residual blend between mask-only and full spike
+                # gating, controlled by per-layer learnable gate_scale.
+                gs = self.gate_scale[i]
+                mask_2d = x_y_mask_flattened.unsqueeze(-1)
+                gating = mask_2d + gs * (g_n.unsqueeze(-1) - mask_2d)
+                obs_gated = observation_nodes * gating
+            else:
+                # Ablation: no spike at all (mask-only gating, zero events)
+                g_n = x_y_mask_flattened
+                e_n = torch.zeros(
+                    observation_nodes.shape[0], observation_nodes.shape[1], Q,
+                    device=observation_nodes.device,
+                    dtype=observation_nodes.dtype)
+                obs_gated = observation_nodes
+
+            # Event warmup: zero e_n for the first `warmup` layers so QMF
+            # learns spatio-temporal fusion before integrating event signal.
+            if i < self.event_layer_warmup:
+                e_n_used = torch.zeros_like(e_n)
+            else:
+                e_n_used = e_n
+
+            # ----------------------------------------------------------------
+            # Step 2: Node -> Temporal hyperedge
+            # ----------------------------------------------------------------
+            temporal_hyperedges = self.node2temporal_hyperedge[i](
+                temporal_hyperedges,
+                torch.cat([
+                    variable_hyperedges.gather(
+                        1,
+                        repeat(variable_indices_flattened,
+                               "B N -> B N D", D=D)
+                    ),
+                    obs_gated,
+                ], -1),
+                (temporal_incidence_matrix * mask_temp_t) if i == 0
+                else temporal_incidence_matrix,
+            )
+
+            # ----------------------------------------------------------------
+            # Step 3: Node -> Variable hyperedge
+            # ----------------------------------------------------------------
+            variable_hyperedges = self.node2variable_hyperedge[i](
+                variable_hyperedges,
+                torch.cat([
+                    temporal_hyperedges.gather(
+                        1,
+                        repeat(time_indices_flattened, "B N -> B N D", D=D)
+                    ),
+                    obs_gated,
+                ], -1),
+                (variable_incidence_matrix * mask_temp_v) if i == 0
+                else variable_incidence_matrix,
+            )
+
+            # ----------------------------------------------------------------
+            # Step 4: Cell-to-cell self-attention (with OOM fallback)
+            # ----------------------------------------------------------------
+            tg = temporal_hyperedges.gather(
+                1, repeat(time_indices_flattened, "B N -> B N D", D=D))
+            vg = variable_hyperedges.gather(
+                1, repeat(variable_indices_flattened, "B N -> B N D", D=D))
+
+            obs_for_h2n = observation_nodes
+            if not self.oom_flag:
+                try:
+                    obs_for_h2n = self.node_self_update[i](
+                        observation_nodes,
+                        torch.cat([tg, vg, observation_nodes], -1),
+                        x_y_mask_flattened.unsqueeze(2)
+                        * x_y_mask_flattened.unsqueeze(1),
+                    )
+                except RuntimeError:
+                    self.oom_flag = True
+                    logger.warning(
+                        "STHQ: cross-cell self-attention OOM, falling back "
+                        "to skip on subsequent layers")
+                    obs_for_h2n = observation_nodes
+
+            # ----------------------------------------------------------------
+            # Step 5: Quaternion Multi-Source Fusion (or linear fallback)
+            # ----------------------------------------------------------------
+            q_R = self.proj_R[i](obs_for_h2n)   # self
+            q_I = self.proj_I[i](tg)             # temporal hyperedge
+            q_J = self.proj_J[i](vg)             # variable hyperedge
+            q_K = e_n_used                        # event features
+            q = torch.cat([q_R, q_I, q_J, q_K], dim=-1)
+
+            if not self.no_quaternion:
+                h2n_out = self.quat_h2n[i](q)
+            else:
+                h2n_out = self.linear_h2n[i](q)
+
+            md = repeat(x_y_mask_flattened, "B N -> B N D", D=D)
+            observation_nodes = self.activation(
+                (observation_nodes + h2n_out) * md)
+
+            # Diagnostic snapshot (detach to avoid grad-graph retention)
+            with torch.no_grad():
+                diag_records.append({
+                    "layer": i,
+                    "g_mean": float(
+                        (g_n * x_y_mask_flattened).sum().item()
+                        / x_y_mask_flattened.sum().clamp_min(1).item()
+                    ),
+                    "e_norm": float(e_n.norm(dim=-1).mean().item()),
+                    "gate_scale": float(self.gate_scale[i].detach().item()),
+                })
+
+            # ----------------------------------------------------------------
+            # Step 6: (last layer) Hyperedge -> Hyperedge via Irregularity attn
+            # ----------------------------------------------------------------
+            if i in self.hyperedge2hyperedge_layers:
+                sync_mask = x_y_mask
+                qk = self.get_fine_grained_embedding(
+                    observation_nodes, sync_mask)
+                mc = sync_mask.transpose(-1, -2) @ sync_mask
+                nopv = mc.diagonal(0, -2, -1)
+                mc[nopv != 0] = (mc / repeat(
+                    nopv, "B E -> B E E2", E2=sync_mask.shape[-1]
+                ))[nopv != 0]
+                variable_hyperedges = (
+                    variable_hyperedges
+                    + self.variable_hyperedge2variable_hyperedge(
+                        x=variable_hyperedges,
+                        query_aux=qk, key_aux=qk,
+                        merge_coefficients=mc,
+                    )
+                )
+
+        return observation_nodes, temporal_hyperedges, variable_hyperedges, diag_records
 
 
 # ============================================================================
@@ -433,148 +557,42 @@ class Model(nn.Module):
     def __init__(self, configs: ExpConfigs):
         super().__init__()
         self.configs = configs
-        D = (configs.d_model // 4) * 4
-        if D != configs.d_model:
-            logger.warning(f"STHQ: rounding d_model {configs.d_model} -> {D}")
-        self.d_model = D
-        self.n_layers = configs.n_layers
         self.enc_in = configs.enc_in
+        self.d_model = (configs.d_model // 4) * 4
+        if self.d_model != configs.d_model:
+            logger.warning(
+                f"STHQ: d_model {configs.d_model} -> {self.d_model} "
+                f"(must be ×4)")
+        D = self.d_model
+        sl = configs.seq_len_max_irr or configs.seq_len
+        pl = configs.pred_len_max_irr or configs.pred_len
+        tl = sl + pl
 
-        self.k_t = int(getattr(configs, "sthq_k_t", 32))
-        self.k_v = int(getattr(configs, "sthq_k_v", min(configs.enc_in, 32)))
-        self.omega_min = float(getattr(configs, "sthq_omega_min", 0.02))
-        self.omega_max = float(getattr(configs, "sthq_omega_max", 0.5))
-        self.use_he_attn_from = int(getattr(configs, "sthq_use_he_attn_from_layer",
-                                            max(1, self.n_layers // 2)))
-
-        # ---- multi-scale per-layer K_t schedule ------------------------------
-        # Comma-separated layer-specific K_t (e.g. "192,64,16" for n_layers=3).
-        # Empty string → all layers share the global k_t.
-        # Layer 0 sees the finest scale (most anchors, narrowest ω); deeper
-        # layers progressively coarsen, providing global aggregation.
-        kt_sched_str = str(getattr(configs, "sthq_k_t_per_layer", "")).strip()
-        if kt_sched_str:
-            kt_per_layer = [int(s) for s in kt_sched_str.split(",")]
-            assert len(kt_per_layer) == self.n_layers, (
-                f"sthq_k_t_per_layer has {len(kt_per_layer)} entries but "
-                f"n_layers={self.n_layers}")
-        else:
-            kt_per_layer = [self.k_t] * self.n_layers
-        self.kt_per_layer = kt_per_layer
-
-        # ---- STEA: per-layer K_e (number of dynamic event anchors) ----------
-        # Empty / 0 → STEA disabled. Per-layer schedule like K_t.
-        self.k_e = int(getattr(configs, "sthq_k_e", 0))
-        ke_sched_str = str(getattr(configs, "sthq_k_e_per_layer", "")).strip()
-        if ke_sched_str:
-            ke_per_layer = [int(s) for s in ke_sched_str.split(",")]
-            assert len(ke_per_layer) == self.n_layers, (
-                f"sthq_k_e_per_layer has {len(ke_per_layer)} entries but "
-                f"n_layers={self.n_layers}")
-        else:
-            ke_per_layer = [self.k_e] * self.n_layers
-        self.ke_per_layer = ke_per_layer
-
-        Q = D // 4
-        self.spike_floor = float(getattr(configs, "sthq_spike_floor", 0.0))
-        self.spike_encoder = SpikeEncoder(
-            configs.enc_in, hidden=Q, floor=self.spike_floor)
-        self.cell_encoder = CellEncoder(D, configs.enc_in)
-
-        self.layers = nn.ModuleList()
-        for l in range(self.n_layers):
-            use_he_attn = (l >= self.use_he_attn_from)
-            self.layers.append(STHQLayer(
-                d_model=D,
-                n_vars=configs.enc_in,
-                k_t=kt_per_layer[l],
-                k_v=self.k_v,
-                k_e=ke_per_layer[l],
-                omega_min=self.omega_min,
-                omega_max=self.omega_max,
-                layer_idx=l,
-                n_layers=self.n_layers,
-                use_he_attn=use_he_attn,
-            ))
-
-        # Time-aware decoder: explicitly sees query (time, var) embedding
-        # plus skip connection from initial cell encoding.
-        D_time_emb = 32
-        self.dec_time_freqs = nn.Parameter(
-            torch.exp(torch.linspace(0.0, math.log(50.0), D_time_emb // 2)))
-        self.dec_var_emb = nn.Embedding(configs.enc_in, D_time_emb)
-        nn.init.normal_(self.dec_var_emb.weight, std=0.1)
-        dec_in_dim = D + D + D_time_emb * 2  # q_final + q_initial + [time_emb, var_emb]
-        self.decoder = nn.Sequential(
-            nn.Linear(dec_in_dim, D),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(D, D // 2),
-            nn.GELU(),
-            nn.Linear(D // 2, 1),
+        self.hypergraph_encoder = HypergraphEncoder(self.enc_in, tl, D)
+        self.hypergraph_learner = HypergraphLearner(
+            n_layers=configs.n_layers,
+            d_model=D,
+            n_heads=configs.n_heads,
+            time_length=tl,
+            n_vars=self.enc_in,
+            spike_floor=float(getattr(configs, "sthq_spike_floor", 0.0)),
+            no_spike=int(getattr(configs, "sthq_no_spike", 0)),
+            no_quaternion=int(getattr(configs, "sthq_no_quaternion", 0)),
+            event_layer_warmup=int(
+                getattr(configs, "sthq_event_layer_warmup", 0)),
         )
+        self.hypergraph_decoder = nn.Linear(3 * D, 1)
 
-        # Anti-collapse regularization weights
-        self.lambda_tau = float(getattr(configs, "sthq_lambda_tau", 0.01))
-        self.lambda_var = float(getattr(configs, "sthq_lambda_var", 0.005))
-
-        # ---- diagnostic logging ----------------------------------------------
-        # Print spike / α / τ / hyperedge usage every diag_interval forward
-        # passes during training. Set to 0 to disable.
         self.diag_interval = int(getattr(configs, "sthq_diag_interval", 0))
-        self.register_buffer("_diag_step", torch.zeros(1, dtype=torch.long),
-                             persistent=False)
+        self.register_buffer(
+            "_diag_step", torch.zeros(1, dtype=torch.long), persistent=False)
 
-    # ---- diagnostics -----------------------------------------------------
-    def _log_diagnostics(self, spike_intensity, contribute_mask):
-        """Print spike / α / τ / ω / var-affinity entropy every diag_interval
-        forward passes during training. Cheap (tensor reductions only)."""
-        if self.diag_interval <= 0 or not self.training:
-            return
-        # increment in-place to keep on-device tracking
-        self._diag_step += 1
-        if (self._diag_step.item() - 1) % self.diag_interval != 0:
-            return
-        with torch.no_grad():
-            active = contribute_mask.bool()
-            if active.any():
-                vs = spike_intensity[active]
-                sm = vs.mean().item()
-                ss = vs.std().item()
-                sa = (vs > 0.5).float().mean().item()
-            else:
-                sm = ss = sa = 0.0
-            layer_stats = []
-            for l, layer in enumerate(self.layers):
-                alpha = torch.sigmoid(layer.alpha_logit).item()
-                tau_min = layer.tau.min().item()
-                tau_max = layer.tau.max().item()
-                tau_std = layer.tau.std().item()
-                om = torch.exp(layer.omega_log).mean().item()
-                gam = torch.exp(layer.spike_omega_gamma_log).item()
-                va_sm = F.softmax(layer.var_affinity, dim=-1)
-                ent = (-(va_sm * va_sm.clamp_min(1e-8).log()).sum(-1).mean()).item()
-                if layer.k_e > 0:
-                    beta = torch.sigmoid(layer.event_mix_logit).item()
-                    om_e = torch.exp(layer.event_omega_log).item()
-                    ev_str = f" K_e={layer.k_e} β={beta:.2f} ω_e={om_e:.3f}"
-                else:
-                    ev_str = ""
-                layer_stats.append(
-                    f"L{l}(K_t={layer.k_t}): α={alpha:.2f} γ={gam:.2f} "
-                    f"τ_std={tau_std:.3f} ω̄={om:.3f} var_ent={ent:.2f}{ev_str}"
-                )
-        logger.debug(
-            f"[STHQ diag step={self._diag_step.item()}] "
-            f"spike: mean={sm:.3f} std={ss:.3f} active={sa:.3f}; "
-            f"{' | '.join(layer_stats)}"
-        )
+    # --- helpers (shared with SQHyper) -----------------------------------
 
-    # ---- helpers (shared with PE-RQH structure) --------------------------
     def pad_and_flatten(self, tensor, mask, max_len):
         B = tensor.shape[0]
         tf = tensor.view(B, -1)
-        mf = mask.view(B, -1).to(tensor.dtype)
+        mf = mask.view(B, -1)
         d = torch.cumsum(mf, 1) - 1
         k = (mf == 1) & (d < max_len)
         r = torch.zeros(B, max_len, dtype=tensor.dtype, device=tensor.device)
@@ -585,15 +603,20 @@ class Model(nn.Module):
     def unpad_and_reshape(self, tensor_flattened, original_mask, original_shape):
         original_mask = original_mask.bool()
         device = tensor_flattened.device
-        result = torch.zeros(original_shape, dtype=tensor_flattened.dtype, device=device)
-        counts = original_mask.sum(dim=tuple(range(1, original_mask.dim())))
+        result = torch.zeros(original_shape, dtype=tensor_flattened.dtype,
+                             device=device)
+        counts = original_mask.sum(
+            dim=tuple(range(1, original_mask.dim())))
         batch_size, max_len = tensor_flattened.shape[:2]
         steps = torch.arange(max_len, device=device).expand(batch_size, max_len)
         src_mask = steps < counts.unsqueeze(-1)
         result[original_mask] = tensor_flattened[src_mask]
         return result
 
-    def forward(self, x, x_mark=None, x_mask=None, y=None, y_mark=None, y_mask=None,
+    # --- forward ----------------------------------------------------------
+
+    def forward(self, x, x_mark=None, x_mask=None, y=None, y_mark=None,
+                y_mask=None,
                 x_L_flattened=None, x_y_mask_flattened=None,
                 y_L_flattened=None, y_mask_L_flattened=None,
                 exp_stage="train", **kwargs):
@@ -601,16 +624,17 @@ class Model(nn.Module):
         Y_LEN = self.configs.pred_len if self.configs.pred_len != 0 else SEQ_LEN
         if x_mark is None:
             x_mark = repeat(
-                torch.arange(end=x.shape[1], dtype=x.dtype, device=x.device) / x.shape[1],
-                "L -> B L 1", B=x.shape[0])
+                torch.arange(end=x.shape[1], dtype=x.dtype, device=x.device)
+                / x.shape[1], "L -> B L 1", B=x.shape[0])
         if x_mask is None:
             x_mask = torch.ones_like(x, device=x.device, dtype=x.dtype)
         if y is None:
-            y = torch.ones((BATCH_SIZE, Y_LEN, ENC_IN), dtype=x.dtype, device=x.device)
+            y = torch.ones((BATCH_SIZE, Y_LEN, ENC_IN), dtype=x.dtype,
+                           device=x.device)
         if y_mark is None:
             y_mark = repeat(
-                torch.arange(end=y.shape[1], dtype=y.dtype, device=y.device) / y.shape[1],
-                "L -> B L 1", B=y.shape[0])
+                torch.arange(end=y.shape[1], dtype=y.dtype, device=y.device)
+                / y.shape[1], "L -> B L 1", B=y.shape[0])
         if y_mask is None:
             y_mask = torch.ones_like(y, device=y.device, dtype=y.dtype)
 
@@ -621,7 +645,7 @@ class Model(nn.Module):
 
         if self.configs.task_name in [
             "short_term_forecast", "long_term_forecast",
-            "classification", "representation_learning"
+            "classification", "representation_learning",
         ]:
             x_zeros = torch.zeros_like(y, dtype=x.dtype, device=x.device)
             y_zeros = torch.zeros_like(x, dtype=y.dtype, device=y.device)
@@ -639,108 +663,110 @@ class Model(nn.Module):
         else:
             raise NotImplementedError()
 
-        time_indices = torch.cumsum(torch.ones_like(x_L).to(torch.int64), dim=1) - 1
-        variable_indices = torch.cumsum(torch.ones_like(x_L).to(torch.int64), dim=-1) - 1
+        time_indices = torch.cumsum(
+            torch.ones_like(x_L).to(torch.int64), dim=1) - 1
+        variable_indices = torch.cumsum(
+            torch.ones_like(x_L).to(torch.int64), dim=-1) - 1
         x_y_mask_bool = x_y_mask.to(torch.bool)
         N_OBSERVATIONS_MAX = torch.max(x_y_mask.sum((1, 2))).to(torch.int64)
         N_OBSERVATIONS_MIN = torch.min(x_y_mask.sum((1, 2))).to(torch.int64)
-        is_regular = (N_OBSERVATIONS_MAX == N_OBSERVATIONS_MIN == L * ENC_IN)
+        is_regular = (
+            N_OBSERVATIONS_MAX == N_OBSERVATIONS_MIN == L * ENC_IN)
 
-        if (x_L_flattened or x_y_mask_flattened or y_L_flattened or y_mask_L_flattened) is None:
+        if (x_L_flattened or x_y_mask_flattened
+                or y_L_flattened or y_mask_L_flattened) is None:
             if is_regular:
                 x_L_flattened = x_L.reshape(BATCH_SIZE, L * ENC_IN)
                 x_y_mask_flattened = x_y_mask.reshape(BATCH_SIZE, L * ENC_IN)
                 y_L_flattened = y_L.reshape(BATCH_SIZE, L * ENC_IN)
                 y_mask_L_flattened = y_mask_L.reshape(BATCH_SIZE, L * ENC_IN)
             else:
-                x_L_flattened = self.pad_and_flatten(x_L, x_y_mask_bool, N_OBSERVATIONS_MAX)
-                x_y_mask_flattened = self.pad_and_flatten(x_y_mask, x_y_mask_bool, N_OBSERVATIONS_MAX)
-                y_L_flattened = self.pad_and_flatten(y_L, x_y_mask_bool, N_OBSERVATIONS_MAX)
-                y_mask_L_flattened = self.pad_and_flatten(y_mask_L, x_y_mask_bool, N_OBSERVATIONS_MAX)
+                x_L_flattened = self.pad_and_flatten(
+                    x_L, x_y_mask_bool, N_OBSERVATIONS_MAX)
+                x_y_mask_flattened = self.pad_and_flatten(
+                    x_y_mask, x_y_mask_bool, N_OBSERVATIONS_MAX)
+                y_L_flattened = self.pad_and_flatten(
+                    y_L, x_y_mask_bool, N_OBSERVATIONS_MAX)
+                y_mask_L_flattened = self.pad_and_flatten(
+                    y_mask_L, x_y_mask_bool, N_OBSERVATIONS_MAX)
 
         if is_regular:
-            time_indices_flattened = time_indices.reshape(BATCH_SIZE, L * ENC_IN)
-            variable_indices_flattened = variable_indices.reshape(BATCH_SIZE, L * ENC_IN)
+            time_indices_flattened = time_indices.reshape(
+                BATCH_SIZE, L * ENC_IN)
+            variable_indices_flattened = variable_indices.reshape(
+                BATCH_SIZE, L * ENC_IN)
         else:
-            time_indices_flattened = self.pad_and_flatten(time_indices, x_y_mask_bool, N_OBSERVATIONS_MAX)
-            variable_indices_flattened = self.pad_and_flatten(variable_indices, x_y_mask_bool, N_OBSERVATIONS_MAX)
+            time_indices_flattened = self.pad_and_flatten(
+                time_indices, x_y_mask_bool, N_OBSERVATIONS_MAX)
+            variable_indices_flattened = self.pad_and_flatten(
+                variable_indices, x_y_mask_bool, N_OBSERVATIONS_MAX)
 
-        times_flat = time_indices_flattened.float() / max(1, L - 1)
-        var_ids_flat = variable_indices_flattened
-        valid_mask = x_y_mask_flattened
-        # contribute_mask excludes future targets (their values are unknown at input)
-        contribute_mask = valid_mask * (1.0 - y_mask_L_flattened)
+        time_norm_flattened = (
+            time_indices_flattened.float() / max(1, L - 1))
 
-        # Spike intensity is computed only on contribute cells (mask gates)
-        spike_intensity = self.spike_encoder(
-            x_L_flattened, times_flat, contribute_mask, var_ids_flat)
-        # Periodic diagnostics on spike / hyperedge state
-        self._log_diagnostics(spike_intensity, contribute_mask)
-
-        # Encode to quaternion state (uses contribute_mask for value gating)
-        q_initial = self.cell_encoder(
-            value=x_L_flattened,
-            time_norm=times_flat,
-            var_id=var_ids_flat,
-            spike_intensity=spike_intensity,
-            mask=valid_mask,
+        # Encode
+        (observation_nodes, temporal_hyperedges, variable_hyperedges,
+         temporal_incidence_matrix, variable_incidence_matrix
+         ) = self.hypergraph_encoder(
+            x_L_flattened, x_y_mask_flattened, y_mask_L_flattened,
+            x_y_mark, variable_indices_flattened, time_indices_flattened,
+            N_OBSERVATIONS_MAX,
         )
 
-        # STHQ layers — query positions still get to receive messages but
-        # don't contribute to forming hyperedges (spike=0 for them).
-        q = q_initial
-        for layer in self.layers:
-            q = layer(
-                q=q,
-                spike_intensity=spike_intensity,
-                time_norm=times_flat,
-                var_id=var_ids_flat,
-                mask=valid_mask,
-            )
+        # Hypergraph learning
+        (observation_nodes, temporal_hyperedges, variable_hyperedges,
+         diag_records) = self.hypergraph_learner(
+            observation_nodes, temporal_hyperedges, variable_hyperedges,
+            time_indices_flattened, variable_indices_flattened,
+            temporal_incidence_matrix, variable_incidence_matrix,
+            x_y_mask_flattened, x_y_mask, y_mask_L_flattened,
+            value_flattened=x_L_flattened,
+            time_norm_flattened=time_norm_flattened,
+        )
 
-        # Time-aware decoder: [q_final | q_initial | sin/cos(time) | var_emb]
-        t_phase = times_flat.unsqueeze(-1) * self.dec_time_freqs  # [B, N, T_emb/2]
-        time_emb = torch.cat([torch.sin(t_phase), torch.cos(t_phase)], dim=-1)
-        var_emb = self.dec_var_emb(var_ids_flat)
-        decoder_input = torch.cat([q, q_initial, time_emb, var_emb], dim=-1)
-        pred_flattened = self.decoder(decoder_input).squeeze(-1)
+        # Diagnostics
+        if self.training and self.diag_interval > 0:
+            self._diag_step += 1
+            if int(self._diag_step.item()) % self.diag_interval == 0:
+                stats = " | ".join([
+                    f"L{r['layer']}: g={r['g_mean']:.3f} "
+                    f"|e|={r['e_norm']:.3f} gs={r['gate_scale']:+.3f}"
+                    for r in diag_records
+                ])
+                logger.debug(
+                    f"[STHQ diag step={int(self._diag_step.item())}] {stats}"
+                )
 
-        # ---- anti-collapse auxiliary loss ------------------------------------
-        # τ repulsion: encourage temporal anchors to spread out within [0, 1]
-        # Penalize pairs of τ's that are too close (< 0.5 * ω_mean).
-        aux_loss = pred_flattened.new_zeros(())
-        if self.training:
-            for layer in self.layers:
-                tau = layer.tau                                # [K_t]
-                omega = torch.exp(layer.omega_log)             # [K_t]
-                # Pairwise distances scaled by mean ω
-                d_tau = (tau.unsqueeze(0) - tau.unsqueeze(1)).abs()
-                mask_pair = ~torch.eye(tau.numel(), dtype=torch.bool, device=tau.device)
-                min_spacing = 0.5 * omega.mean()
-                repulse = F.relu(min_spacing - d_tau) ** 2
-                aux_loss = aux_loss + self.lambda_tau * repulse[mask_pair].mean()
-                # Variable affinity: penalize near-collapse of softmax (entropy bonus)
-                var_softmax = F.softmax(layer.var_affinity, dim=-1)
-                ent = -(var_softmax * (var_softmax.clamp_min(1e-8)).log()).sum(-1).mean()
-                aux_loss = aux_loss - self.lambda_var * ent
-        result = {
-            "pred": pred_flattened,
-            "true": y_L_flattened,
-            "mask": y_mask_L_flattened,
-            "aux_loss": aux_loss,
-        }
+        # Decode
+        if self.configs.task_name in [
+            "long_term_forecast", "short_term_forecast", "imputation"
+        ]:
+            D = self.d_model
+            pred_flattened = self.hypergraph_decoder(torch.cat([
+                observation_nodes,
+                temporal_hyperedges.gather(
+                    1, repeat(time_indices_flattened, "B N -> B N D", D=D)),
+                variable_hyperedges.gather(
+                    1,
+                    repeat(variable_indices_flattened,
+                           "B N -> B N D", D=D)),
+            ], dim=-1)).squeeze(-1)
 
-        if self.configs.task_name in ['long_term_forecast', 'short_term_forecast', 'imputation']:
             if exp_stage in ["train", "val"]:
-                return result
+                return {
+                    "pred": pred_flattened,
+                    "true": y_L_flattened,
+                    "mask": y_mask_L_flattened,
+                }
             else:
-                pred_full = self.unpad_and_reshape(
-                    pred_flattened, torch.cat([x_mask, y_mask], dim=1),
+                pred = self.unpad_and_reshape(
+                    pred_flattened,
+                    torch.cat([x_mask, y_mask], dim=1),
                     (BATCH_SIZE, SEQ_LEN + PRED_LEN, ENC_IN),
                 )
-                f_dim = -1 if self.configs.features == 'MS' else 0
+                f_dim = -1 if self.configs.features == "MS" else 0
                 return {
-                    "pred": pred_full[:, -PRED_LEN:, f_dim:],
+                    "pred": pred[:, -PRED_LEN:, f_dim:],
                     "true": y[:, :, f_dim:],
                     "mask": y_mask[:, :, f_dim:],
                 }

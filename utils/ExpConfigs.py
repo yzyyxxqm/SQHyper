@@ -185,19 +185,12 @@ class ExpConfigs:
     scperqh_tau_decay: float
     scperqh_lambda_div: float
     scperqh_lambda_commit: float
-    # STHQ-Net (Spike-Triggered Hyperedge with Quaternion States)
-    sthq_k_t: int
-    sthq_k_v: int
-    sthq_omega_min: float
-    sthq_omega_max: float
-    sthq_use_he_attn_from_layer: int
-    sthq_lambda_tau: float
-    sthq_lambda_var: float
-    sthq_k_t_per_layer: str
-    sthq_diag_interval: int
+    # STHQ v7: Spike-Triggered Hypergraph with Quaternion fusion
     sthq_spike_floor: float
-    sthq_k_e: int
-    sthq_k_e_per_layer: str
+    sthq_event_layer_warmup: int
+    sthq_no_spike: int
+    sthq_no_quaternion: int
+    sthq_diag_interval: int
     # ReIMTS
     reimts_pad_time_emb: int
     # ScaleFormer

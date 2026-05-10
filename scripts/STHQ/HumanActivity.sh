@@ -15,14 +15,13 @@ get_dataset_info "$dataset_name" "$dataset_subset_name"
 model_name="$(basename "$(dirname "$(readlink -f "$0")")")"
 model_id=$model_name
 
-# HumanActivity: V=12, seq_len=3000 (long sequence -> more time anchors)
 seq_len=3000
 for pred_len in 3; do
     $launch_command main.py \
     --is_training 1 \
     --collate_fn "collate_fn" \
-    --loss "MSE_aux" \
-    --d_model 256 \
+    --loss "MSE" \
+    --d_model 128 \
     --n_layers 3 \
     --n_heads 1 \
     --use_multi_gpu $use_multi_gpu \
@@ -37,19 +36,12 @@ for pred_len in 3; do
     --enc_in $n_variables \
     --dec_in $n_variables \
     --c_out $n_variables \
-    --train_epochs 50 \
-    --patience 4 \
+    --train_epochs 300 \
+    --patience 10 \
     --val_interval 1 \
-    --itr 2 \
-    --batch_size 16 \
+    --itr 5 \
+    --batch_size 32 \
     --learning_rate 1e-3 \
-    --sthq_k_t 128 \
-    --sthq_k_v 12 \
-    --sthq_k_t_per_layer "384,128,32" \
-    --sthq_omega_min 0.004 \
-    --sthq_omega_max 0.2 \
-    --sthq_use_he_attn_from_layer 1 \
-    --sthq_diag_interval 200 \
     --sthq_spike_floor 0.1 \
-    --sthq_k_e_per_layer "32,16,8"
+    --sthq_diag_interval 200
 done

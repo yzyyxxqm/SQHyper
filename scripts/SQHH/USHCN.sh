@@ -5,16 +5,18 @@ else
     launch_command="accelerate launch"
 fi
 
-. "$(dirname "$(readlink -f "$0")")/../globals.sh"
+. "$(dirname "$(readlink -f "$0")")/../globals.sh" # Import shared information from scripts/globals.sh
 
-dataset_name=$(basename "$0" .sh)
+dataset_name="USHCN"
 dataset_subset_name=""
 dataset_id=$dataset_name
 get_dataset_info "$dataset_name" "$dataset_subset_name"
 
-model_name="$(basename "$(dirname "$(readlink -f "$0")")")"
+model_name="SQHH"
 model_id=$model_name
 
+# Training config aligned 1:1 with scripts/HyperIMTS/USHCN.sh.
+# Only --model_name and SQHH-specific architectural args differ.
 seq_len=150
 for pred_len in 3; do
     $launch_command main.py \
@@ -22,8 +24,8 @@ for pred_len in 3; do
     --collate_fn "collate_fn" \
     --loss "MSE" \
     --d_model 256 \
-    --n_layers 2 \
-    --n_heads 2 \
+    --n_layers 1 \
+    --n_heads 1 \
     --use_multi_gpu $use_multi_gpu \
     --dataset_root_path $dataset_root_path \
     --model_id $model_id \
@@ -37,13 +39,11 @@ for pred_len in 3; do
     --dec_in $n_variables \
     --c_out $n_variables \
     --train_epochs 300 \
-    --patience 25 \
+    --patience 10 \
     --val_interval 1 \
     --itr 5 \
     --batch_size 16 \
     --learning_rate 1e-3 \
-    --use_amp 1 \
-    --use_compile 0 \
     --sqhh_k_a 16 \
     --sqhh_k_e 24 \
     --sqhh_spike_floor 0.1 \

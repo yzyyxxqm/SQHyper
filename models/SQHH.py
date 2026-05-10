@@ -1,24 +1,45 @@
-# SQHH: Spike-Quaternion Heterogeneous Hypergraph
+# SQHH v2: Spike-Quaternion Hypergraph (SQHyper backbone + SRI + SQC)
 #
-# A novel hypergraph paradigm for IMTS forecasting where:
-#   - Cells are quaternion-typed natively (R=value, I=time, J=variable, K=spike)
-#   - Three heterogeneous hyperedge layers coexist:
-#       L0 (Primary):  per-observation self-loop, guarantees no info loss
-#       L1 (Event):    spike-triggered dynamic edges with refractory inhibition
-#       L2 (Anchor):   K_a quaternion anchors with quaternion-distance incidence
-#   - Spike-Refractory Activation (SRA) inspired by SNN refractory periods
-#   - Spike-Quaternion Coupling (SQC): spike rotates cell quaternion towards
-#     the K-axis ("event subspace") before message passing
-#   - Quaternion Hypergraph Attention (QHA): Hamilton-product structured
-#     Q/K/V projections, preserving cross-component coupling
+# Design history:
+#   - SQHH v0 (paradigm reset: L0 primary / L1 spike-event / L2 anchor
+#     hypergraph layers) was architected, implemented and deployed on 4
+#     IMTS datasets. Empirical result: 12x regression on HumanActivity
+#     vs SQHyper baseline (0.016 -> 0.20+) because the decoder lost the
+#     hyperedge-gather mechanism. Archived in models/SQHH_v0_archive.py.
+#   - SQHH v1 (scatter-mean time/var summaries at decode) partially fixed
+#     P12 and MIMIC_III but HumanActivity remained ~13x above baseline,
+#     showing static aggregation can't match attention-based learnable
+#     hyperedges on long sequences.
+#   - SQHH v2 (this file) accepts the evidence: keep SQHyper's learnable
+#     hyperedge backbone and inject two focused, testable SQHH
+#     contributions on top.
 #
-# HyperIMTS / SQHyper are recovered as degenerate special cases:
-#   - Single layer (L1+L2 disabled), hard incidence (no quat anchors), no SRA,
-#     no SQC, dot-product attention with real-valued Linear projections.
+# Two contributions over SQHyper:
 #
-# This file builds bottom-up: primitives -> SRA -> SQC -> Layer 0 -> Layer 2
-# -> Layer 1 -> main Model. Each module carries a docstring with the math
-# from docs/my_paper/SQHH_design.md.
+#   1. SRI (Spike-Refractory Incidence): SGI detects spikes purely via
+#      membrane potential (context deviation). SRI adds a per-variable
+#      refractory time-constant tau_v: after a spike at time t_m on
+#      variable v, subsequent spikes on v within tau_v are inhibited by
+#      (1 - tanh(alpha_v * sum_m spike_m * exp(-(t_n - t_m)/tau_v))).
+#      Interpretation: physical sensors / biological events have
+#      characteristic cooldown windows; bursty re-spikes are usually noise
+#      or duplication of the same underlying event.
+#
+#   2. SQC (Spike-Quaternion Coupling): before each layer's node2hyperedge
+#      attention, apply a spike-driven quaternion rotation to the cell
+#      embeddings. Rotation angle theta_n = theta_max * spike[n] around
+#      the K-axis. SGI gives spike scalar gating (magnitude), SQC gives
+#      spike orthogonal geometric action (direction).
+#
+# Ablations:
+#   --sqhh_no_sri    : use SQHyper's SGI instead of SRI (no refractory)
+#   --sqhh_no_sqc    : skip quaternion rotation (back to scalar gating)
+#   --sqhh_no_qmf    : flat linear fusion (inherited from SQHyper)
+#
+# Note on parameter names: we keep the historical `sqhh_*` flag prefix so
+# existing scripts under scripts/SQHH/*.sh continue to work. The flags
+# sqhh_k_a, sqhh_k_e, sqhh_no_layer0/1/2 from SQHH v0 are accepted but
+# ignored (no L0/L1/L2 layers in v2).
 
 import math
 import torch
@@ -26,42 +47,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import repeat, rearrange
 from torch import Tensor
-
 from utils.ExpConfigs import ExpConfigs
 from utils.globals import logger
 
 
 # ============================================================================
-# Quaternion primitives
+# Quaternion Linear (identical to SQHyper)
 # ============================================================================
 
-
 class QuaternionLinear(nn.Module):
-    """Hamilton-product-structured linear layer.
+    """Quaternion-algebra linear layer with structured cross-group interactions."""
 
-    For input/output dim 4Q, parameter count is 4 * Q * Q (1/4 of flat
-    Linear). The block matrix W enforces that input components R/I/J/K
-    interact through Hamilton multiplication rules:
-
-        W = [[ R, -I, -J, -K],
-             [ I,  R, -K,  J],
-             [ J,  K,  R, -I],
-             [ K, -J,  I,  R]]
-    """
-
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_f, out_f, bias=True):
         super().__init__()
-        assert in_features % 4 == 0 and out_features % 4 == 0, (
-            f"QuaternionLinear requires dims divisible by 4, "
-            f"got {in_features}, {out_features}"
+        assert in_f % 4 == 0 and out_f % 4 == 0, (
+            f"QuaternionLinear requires in_f and out_f divisible by 4, "
+            f"got {in_f}, {out_f}"
         )
-        qi, qo = in_features // 4, out_features // 4
+        qi, qo = in_f // 4, out_f // 4
         self.r = nn.Parameter(torch.empty(qo, qi))
         self.i = nn.Parameter(torch.empty(qo, qi))
         self.j = nn.Parameter(torch.empty(qo, qi))
         self.k = nn.Parameter(torch.empty(qo, qi))
-        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
-        self.init_xavier()
+        self.bias = nn.Parameter(torch.zeros(out_f)) if bias else None
 
     def init_identity(self):
         nn.init.eye_(self.r)
@@ -70,7 +78,7 @@ class QuaternionLinear(nn.Module):
         nn.init.zeros_(self.k)
 
     def init_xavier(self):
-        for p in (self.r, self.i, self.j, self.k):
+        for p in [self.r, self.i, self.j, self.k]:
             nn.init.xavier_uniform_(p)
 
     def forward(self, x):
@@ -84,735 +92,559 @@ class QuaternionLinear(nn.Module):
         return F.linear(x, W, self.bias)
 
 
+# ============================================================================
+# Quaternion utilities (for SQC rotation)
+# ============================================================================
+
 def quaternion_split(q: Tensor):
-    """Split a [..., 4Q] tensor into 4 tensors of [..., Q]."""
     Q = q.shape[-1] // 4
-    return q[..., :Q], q[..., Q:2*Q], q[..., 2*Q:3*Q], q[..., 3*Q:]
+    return q[..., :Q], q[..., Q:2 * Q], q[..., 2 * Q:3 * Q], q[..., 3 * Q:]
 
 
 def quaternion_concat(qr, qi, qj, qk):
-    """Concatenate 4 [..., Q] tensors along the last dim into [..., 4Q]."""
     return torch.cat([qr, qi, qj, qk], dim=-1)
 
 
 def hamilton_product(p: Tensor, q: Tensor) -> Tensor:
-    """Element-wise Hamilton product. p, q: [..., 4Q] -> [..., 4Q]."""
     pr, pi, pj, pk = quaternion_split(p)
     qr, qi, qj, qk = quaternion_split(q)
-    out_r = pr * qr - pi * qi - pj * qj - pk * qk
-    out_i = pr * qi + pi * qr + pj * qk - pk * qj
-    out_j = pr * qj - pi * qk + pj * qr + pk * qi
-    out_k = pr * qk + pi * qj - pj * qi + pk * qr
-    return quaternion_concat(out_r, out_i, out_j, out_k)
-
-
-def quaternion_conjugate(q: Tensor) -> Tensor:
-    """Negate i, j, k components: q* = (qr, -qi, -qj, -qk)."""
-    qr, qi, qj, qk = quaternion_split(q)
-    return quaternion_concat(qr, -qi, -qj, -qk)
-
-
-def quaternion_norm_sq(q: Tensor) -> Tensor:
-    """Squared norm summed over the 4Q dimensions: returns [..., 1]."""
-    return q.pow(2).sum(dim=-1, keepdim=True)
-
-
-def quaternion_distance(p: Tensor, q: Tensor) -> Tensor:
-    """||p ⊗ conj(q)||² which captures both magnitude and rotation.
-
-    For unit quaternions this is 2 - 2*<p, q> (twice the chordal distance).
-    Returns [..., 1].
-    """
-    return quaternion_norm_sq(hamilton_product(p, quaternion_conjugate(q)))
-
-
-def quaternion_exp_K(theta: Tensor, Q: int) -> Tensor:
-    """exp(theta * ê_K) for the unit K-axis quaternion ê_K = (0, 0, 0, 1).
-
-    Closed form:
-        exp(theta * (0,0,0,1)) = cos(theta) + sin(theta) * (0,0,0,1)
-                               = (cos(theta), 0, 0, sin(theta))
-
-    Args:
-        theta: [..., 1] or scalar — rotation angle
-        Q: per-component dimension
-
-    Returns: [..., 4Q] quaternion. The R-component is filled with cos(theta)
-    repeated Q times, K-component with sin(theta) repeated Q times.
-    """
-    cos_t = torch.cos(theta)
-    sin_t = torch.sin(theta)
-    zero = torch.zeros_like(cos_t)
-    # Broadcast each component to Q dim
-    cos_Q = cos_t.expand(*cos_t.shape[:-1], Q)
-    sin_Q = sin_t.expand(*sin_t.shape[:-1], Q)
-    zero_Q = zero.expand(*zero.shape[:-1], Q)
-    return quaternion_concat(cos_Q, zero_Q, zero_Q, sin_Q)
-
-
-class QuaternionLayerNorm(nn.Module):
-    """Per-component LayerNorm (R, I, J, K each normalized independently)."""
-
-    def __init__(self, d_model):
-        super().__init__()
-        assert d_model % 4 == 0
-        self.Q = d_model // 4
-        self.ln_r = nn.LayerNorm(self.Q)
-        self.ln_i = nn.LayerNorm(self.Q)
-        self.ln_j = nn.LayerNorm(self.Q)
-        self.ln_k = nn.LayerNorm(self.Q)
-
-    def forward(self, x):
-        qr, qi, qj, qk = quaternion_split(x)
-        return quaternion_concat(
-            self.ln_r(qr), self.ln_i(qi), self.ln_j(qj), self.ln_k(qk)
-        )
+    # Hamilton product (p * q)
+    r = pr * qr - pi * qi - pj * qj - pk * qk
+    i = pr * qi + pi * qr + pj * qk - pk * qj
+    j = pr * qj - pi * qk + pj * qr + pk * qi
+    k = pr * qk + pi * qj - pj * qi + pk * qr
+    return quaternion_concat(r, i, j, k)
 
 
 # ============================================================================
-# Quaternion Hypergraph Attention (QHA)
+# Spike-Refractory Incidence (SRI) — SGI + per-variable refractory dynamics
 # ============================================================================
 
+class SpikeRefractoryIncidence(nn.Module):
+    """Drop-in replacement for SGI with per-variable refractory inhibition.
 
-class QuaternionMHA(nn.Module):
-    """Quaternion-structured multi-head attention.
+    Forward pass mirrors SGI:
+        g_n: (B, N) gate in (0, 1], masked
+        e_n: (B, N, D/4) event features, gated by g_n
 
-    All projections are QuaternionLinear (1/4 params of vanilla, preserves
-    cross-component Hamilton coupling). Score is computed as the real part
-    of the Hamilton product, which factors as:
+    Refractory extension: given detected raw spike s_n in (0, 1], for each
+    cell n we compute an inhibition from all earlier cells of the same
+    variable v_n:
+        inh_n = sum_{m: v_m == v_n, t_m < t_n} s_m * exp(-(t_n - t_m) / tau[v_n])
+        g_refr_n = 1 - tanh(alpha[v_n] * inh_n) in (0, 1]
+        g_n = g_raw_n * g_refr_n
 
-        Re(Q_i ⊗ conj(K_j)) = Q_i^R·K_j^R + Q_i^I·K_j^I
-                              + Q_i^J·K_j^J + Q_i^K·K_j^K
+    Interpretation: tau[v_n] is the characteristic cooldown of variable v_n;
+    alpha[v_n] is the strength of inhibition. Both are learned (per-variable).
 
-    Numerically equal to dot product, but the projections preserving Hamilton
-    structure ensure that the four channels carry distinct semantics
-    (value/time/variable/spike) throughout. The output projection is
-    quaternion-typed.
-
-    Optional `rotate_v` flag enables Hamilton-product correction on V before
-    aggregation (rotates V[j] by the imaginary part of Q[i]⊗conj(K[j]) for
-    each query-key pair). This is the QHA-distinct mechanism over standard
-    quaternion attention. Defaults off because it's O(N²·D) memory.
+    Initialization is tuned so that at init:
+        membrane_proj.bias = +3  ->  g_raw approx sigmoid(3) ~= 0.95
+        event_proj weights = 0   ->  e_n approx 0
+        tau_init = 0.1           ->  1/e decay over 10% of normalized time
+        alpha_init = 0.0         ->  inhibition off at init (g_refr = 1)
+    This means SRI degrades smoothly to SGI at init; refractory activates
+    only as alpha learns to grow.
     """
 
-    def __init__(self, d_model: int, num_heads: int = 1, dropout: float = 0.0,
-                 dot_product_only: bool = False):
+    def __init__(self, d_model: int, n_vars: int,
+                 tau_init: float = 0.1, alpha_init: float = 0.0,
+                 no_refractory: bool = False):
         super().__init__()
-        assert d_model % 4 == 0, "d_model must be ×4"
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        # Per-head dim must also be ×4 so each head is quaternion-typed
-        head_dim = d_model // num_heads
-        assert head_dim % 4 == 0, (
-            f"per-head dim must be ×4, got d_model={d_model}, "
-            f"num_heads={num_heads}, head_dim={head_dim}"
-        )
         self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.dot_product_only = bool(dot_product_only)
-
-        self.fc_q = QuaternionLinear(d_model, d_model)
-        self.fc_k = QuaternionLinear(d_model, d_model)
-        self.fc_v = QuaternionLinear(d_model, d_model)
-        self.fc_o = QuaternionLinear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.scale = 1.0 / math.sqrt(head_dim)
-
-    def forward(self, query: Tensor, key: Tensor, value: Tensor,
-                mask: Tensor | None = None):
-        """
-        query : [B, Nq, D]
-        key   : [B, Nk, D]
-        value : [B, Nk, D]
-        mask  : [B, Nq, Nk] (1 for valid, 0 for masked) or None
-        """
-        B, Nq, D = query.shape
-        Nk = key.shape[1]
-        H, hd = self.num_heads, self.head_dim
-
-        Q = self.fc_q(query).view(B, Nq, H, hd).transpose(1, 2)  # [B,H,Nq,hd]
-        K = self.fc_k(key).view(B, Nk, H, hd).transpose(1, 2)
-        V = self.fc_v(value).view(B, Nk, H, hd).transpose(1, 2)
-
-        # Score = Re(Q ⊗ conj(K)) = standard dot product (per quaternion).
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # [B,H,Nq,Nk]
-        if mask is not None:
-            # mask: [B, Nq, Nk] -> [B, 1, Nq, Nk]
-            scores = scores.masked_fill(mask.unsqueeze(1) == 0, -1e9)
-        attn = torch.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-
-        out = torch.matmul(attn, V)                                # [B,H,Nq,hd]
-        out = out.transpose(1, 2).reshape(B, Nq, D)                # [B,Nq,D]
-        return self.fc_o(out)
-
-
-# ============================================================================
-# Spike-Refractory Activation (SRA)
-# ============================================================================
-
-
-class SpikeRefractoryEncoder(nn.Module):
-    """Spike encoder with SNN-inspired refractory inhibition.
-
-    Forward pass:
-        spike_raw[n] = sigmoid(SpikeMLP(value, time, mask, var_emb))
-        refractory[n] = Σ_{m: var_m == var_n, t_m < t_n}
-                        spike_eff[m] · exp(-(t_n - t_m) / tau_r)
-        spike_eff[n] = max(floor, spike_raw[n] · (1 - tanh(alpha · refractory[n])))
-
-    Implementation:
-        - We approximate refractory by computing the per-variable decayed sum
-          using a single matrix multiplication per variable id, masked to
-          earlier time only.
-        - This is O(N²) per batch but with small constants since N is the
-          flattened observation count.
-    """
-
-    def __init__(self, n_vars: int, d_model: int, hidden: int | None = None,
-                 floor: float = 0.0, tau_r_init: float = 0.1,
-                 alpha_init: float = 1.0, no_refractory: bool = False):
-        super().__init__()
-        H = hidden if hidden is not None else max(16, d_model // 4)
-        self.var_emb = nn.Embedding(n_vars, H)
-        nn.init.normal_(self.var_emb.weight, std=0.1)
-        self.body = nn.Sequential(
-            nn.Linear(3 + H, H), nn.GELU(), nn.Linear(H, H),
-        )
-        self.gate_head = nn.Linear(H, 1)
-        nn.init.zeros_(self.gate_head.weight)
-        nn.init.constant_(self.gate_head.bias, 2.0)  # sigmoid(2) ≈ 0.88
-        # Per-variable refractory time-constant tau_r and inhibition alpha.
-        # Stored as log so they remain positive after exp().
-        self.log_tau_r = nn.Parameter(
-            torch.full((n_vars,), math.log(tau_r_init)))
-        self.log_alpha = nn.Parameter(
-            torch.full((n_vars,), math.log(alpha_init)))
-        self.floor = float(floor)
+        self.n_vars = n_vars
         self.no_refractory = bool(no_refractory)
 
-    def forward(self, value: Tensor, time_norm: Tensor, mask: Tensor,
-                var_id: Tensor):
+        # Identical to SGI
+        self.membrane_proj = nn.Linear(d_model * 2, 1)
+        nn.init.zeros_(self.membrane_proj.weight)
+        nn.init.constant_(self.membrane_proj.bias, 3.0)
+        self.event_proj = nn.Linear(d_model * 2, d_model // 4)
+        nn.init.zeros_(self.event_proj.weight)
+        nn.init.zeros_(self.event_proj.bias)
+
+        # Refractory parameters per variable (stored as log for positivity).
+        # alpha starts at log(very small) so tanh(alpha * inh) ~= 0 at init,
+        # i.e., SRI initially behaves as SGI. Model can grow alpha if needed.
+        self.log_tau = nn.Parameter(
+            torch.full((n_vars,), math.log(max(tau_init, 1e-4))))
+        # alpha_init is used as the multiplier AT init. If alpha_init=0 we
+        # actually want log_alpha to give exp(log_alpha) = 0 which is
+        # impossible, so we use a very small positive value.
+        self.log_alpha = nn.Parameter(
+            torch.full((n_vars,),
+                       math.log(max(alpha_init, 1e-4)) if alpha_init > 0
+                       else math.log(1e-4)))
+
+    def forward(self, obs: Tensor, mask_flat: Tensor,
+                variable_incidence_matrix: Tensor,
+                variable_indices_flattened: Tensor,
+                time_norm: Tensor):
         """
-        value     : [B, N]
-        time_norm : [B, N] in [0, 1]
-        mask      : [B, N] (1 for observed, 0 for padding)
-        var_id    : [B, N] long
-        Returns:  spike_eff [B, N] in [floor, 1] for observed cells, 0 padding
+        Args:
+            obs: (B, N, D) observation node embeddings
+            mask_flat: (B, N) observation mask (1 observed, 0 padding)
+            variable_incidence_matrix: (B, E, N)
+            variable_indices_flattened: (B, N) long
+            time_norm: (B, N) in [0, 1]
+        Returns:
+            g_n: (B, N) spike gate in (0, 1], masked
+            e_n: (B, N, D/4) event features (gated by g_n), masked
         """
-        B, N = value.shape
-        ve = self.var_emb(var_id)
-        feats = torch.cat([
-            (value * mask).unsqueeze(-1),
-            time_norm.unsqueeze(-1),
-            mask.unsqueeze(-1),
-            ve,
-        ], dim=-1)
-        h = self.body(feats)
-        spike_raw = torch.sigmoid(self.gate_head(h).squeeze(-1)) * mask
+        D = obs.shape[-1]
+        # Per-variable context via hypergraph structure (same as SGI)
+        var_count = variable_incidence_matrix.sum(-1, keepdim=True).clamp(min=1)
+        var_context = (variable_incidence_matrix @ obs) / var_count  # (B, E, D)
+        obs_var_ctx = var_context.gather(
+            1, repeat(variable_indices_flattened, "B N -> B N D", D=D))
+        deviation = obs - obs_var_ctx
+        membrane_input = torch.cat([obs, deviation], dim=-1)
+        membrane = self.membrane_proj(membrane_input).squeeze(-1)
+        g_raw = torch.sigmoid(membrane) * mask_flat  # (B, N)
+        e_n = self.event_proj(membrane_input) * g_raw.unsqueeze(-1)
+        e_n = e_n * mask_flat.unsqueeze(-1)
 
         if self.no_refractory:
-            spike_eff = self.floor + (1.0 - self.floor) * spike_raw
-            return spike_eff * mask
+            return g_raw, e_n
 
-        # Per-cell tau_r and alpha looked up by variable id
-        tau_r = torch.exp(self.log_tau_r)[var_id]      # [B, N]
-        alpha = torch.exp(self.log_alpha)[var_id]      # [B, N]
+        # ----- Refractory inhibition (core SRI contribution) -----
+        # Per-cell tau and alpha looked up by variable id.
+        tau = torch.exp(self.log_tau)[variable_indices_flattened]
+        alpha = torch.exp(self.log_alpha)[variable_indices_flattened]  # (B, N)
 
-        # Build pair masks: same-variable, earlier time
-        var_eq = (var_id.unsqueeze(2) == var_id.unsqueeze(1))    # [B, N, N]
-        time_diff = time_norm.unsqueeze(2) - time_norm.unsqueeze(1)  # [B,N,N]
-        earlier = (time_diff > 0).to(value.dtype)              # m before n
-        valid_pair = (mask.unsqueeze(2) * mask.unsqueeze(1))   # both observed
-        pair_mask = var_eq.float() * earlier * valid_pair      # [B, N, N]
-
-        # Decay kernel: exp(-(t_n - t_m) / tau_r[var_n])
-        # tau_r per RECEIVING cell (row n) — broadcast over m
-        decay = torch.exp(
-            -time_diff.clamp_min(0) / tau_r.unsqueeze(2).clamp_min(1e-6)
+        # Pair masks: same variable, earlier time, both observed.
+        same_var = (
+            variable_indices_flattened.unsqueeze(2)
+            == variable_indices_flattened.unsqueeze(1)
         )
+        time_diff = time_norm.unsqueeze(2) - time_norm.unsqueeze(1)  # t_n - t_m
+        earlier = (time_diff > 0).to(obs.dtype)  # m before n
+        valid_pair = (
+            mask_flat.unsqueeze(2) * mask_flat.unsqueeze(1))  # both observed
+        pair_mask = same_var.float() * earlier * valid_pair  # (B, N, N)
 
-        # Refractory sum at cell n is over m
-        # spike_raw_m: [B, N] -> [B, 1, N]
-        refractory_input = spike_raw.unsqueeze(1)              # [B, 1, N]
-        refractory = (pair_mask * decay * refractory_input).sum(dim=-1)  # [B,N]
+        # Decay kernel exp(-(t_n - t_m) / tau[v_n]). tau[v_n] is per
+        # receiving cell (row n).
+        decay = torch.exp(
+            -time_diff.clamp_min(0) / tau.unsqueeze(2).clamp_min(1e-6))
+        # Sum over m: inhibition input uses raw spike s_m
+        inh = (pair_mask * decay * g_raw.unsqueeze(1)).sum(dim=-1)  # (B, N)
+        g_refr = 1.0 - torch.tanh(alpha * inh)  # in (0, 1]
+        g_n = g_raw * g_refr  # masked by g_raw via g_raw * mask
 
-        inhibit = torch.tanh(alpha * refractory)               # [B, N] in [0,1]
-        spike_modulated = spike_raw * (1.0 - inhibit)
-        spike_eff = self.floor + (1.0 - self.floor) * spike_modulated
-        return spike_eff * mask
+        # Also dampen event features by refractory factor
+        e_n = e_n * g_refr.unsqueeze(-1)
+        return g_n, e_n
 
 
 # ============================================================================
 # Spike-Quaternion Coupling (SQC) rotation
 # ============================================================================
 
-
 class SpikeQuaternionRotation(nn.Module):
-    """Rotate cell quaternion towards the K-axis by a spike-driven angle.
+    """Rotate quaternion embedding around K-axis by angle theta_n = theta_max * spike[n].
 
-        rot[n]   = exp(theta_n · ê_K) = (cos θ_n, 0, 0, sin θ_n)
-        q_n_rot  = rot[n] ⊗ q_n
-        theta_n  = theta_max · spike[n]   (theta_max learnable in [0, π/2])
+    rot_n = (cos(theta_n/2), 0, 0, sin(theta_n/2))  (unit quaternion)
+    out   = rot_n * q  (Hamilton product, per cell)
 
-    High-spike cells are rotated up to theta_max towards the K-axis,
-    bringing them into an "event subspace" that downstream layers can attend
-    to differentially.
+    Geometric effect: preserves norm, acts orthogonally. When spike = 0 the
+    rotation is identity. theta_max is a learnable scalar initialized small
+    so the init behavior is near-identity (small perturbation).
     """
 
-    def __init__(self, theta_max_init: float = math.pi / 4):
+    def __init__(self, theta_max_init: float = math.pi / 8):
         super().__init__()
-        # Parameterize theta_max via sigmoid so it stays in (0, π/2)
-        # raw = 0 -> sigmoid(0)=0.5 -> theta_max = π/4
-        init_logit = math.log(
-            (2.0 * theta_max_init / math.pi)
-            / (1.0 - 2.0 * theta_max_init / math.pi)
-        )
-        self.theta_max_logit = nn.Parameter(torch.tensor(init_logit))
+        # Learnable theta_max, initialized at pi/8 (small rotation).
+        # Stored raw (can go negative).
+        self.theta_max = nn.Parameter(torch.tensor(float(theta_max_init)))
 
-    def forward(self, q: Tensor, spike: Tensor):
+    def forward(self, q: Tensor, spike: Tensor) -> Tensor:
         """
-        q     : [B, N, 4Q]
-        spike : [B, N]
+        Args:
+            q:     (B, N, D) quaternion-valued embedding, D % 4 == 0
+            spike: (B, N) in [0, 1]
+        Returns:
+            q_rot: (B, N, D) same shape, rotated
         """
-        Q = q.shape[-1] // 4
-        theta_max = (math.pi / 2.0) * torch.sigmoid(self.theta_max_logit)
-        theta = theta_max * spike.unsqueeze(-1)                    # [B, N, 1]
-        rot = quaternion_exp_K(theta, Q)                           # [B, N, 4Q]
+        D = q.shape[-1]
+        Q = D // 4
+        assert D % 4 == 0, f"SQC requires D % 4 == 0, got {D}"
+
+        theta = (self.theta_max * spike).unsqueeze(-1)  # (B, N, 1)
+        c = torch.cos(theta * 0.5)  # (B, N, 1)
+        s = torch.sin(theta * 0.5)  # (B, N, 1)
+
+        # Build rotation quaternion (cos, 0, 0, sin) broadcast to (B, N, D)
+        zeros = torch.zeros_like(c).expand(-1, -1, Q)
+        rot = torch.cat([
+            c.expand(-1, -1, Q),
+            zeros,
+            zeros,
+            s.expand(-1, -1, Q),
+        ], dim=-1)
         return hamilton_product(rot, q)
 
 
 # ============================================================================
-# Cell Encoder: produces quaternion cells with R/I/J/K = value/time/var/spike
+# MultiHeadAttentionBlock (identical to SQHyper / HyperIMTS)
 # ============================================================================
 
-
-class QuaternionCellEncoder(nn.Module):
-    """Initialize each cell's quaternion state with semantic component split.
-
-    R-channel (value):     MLP on (value, mask) → ℝ^Q
-    I-channel (time):      sin(t · ω) ⊕ cos(t · ω), Q learnable freqs
-    J-channel (variable):  Variable embedding ℝ^Q
-    K-channel (spike):     MLP on spike intensity ℝ^Q
-
-    Then a single QuaternionLinear mixes all four (preserves typing).
-    """
-
-    def __init__(self, d_model: int, n_vars: int):
+class MultiHeadAttentionBlock(nn.Module):
+    def __init__(self, dim_Q, dim_K, dim_V, n_dim, num_heads, ln=False):
         super().__init__()
-        assert d_model % 4 == 0
-        self.Q = d_model // 4
-        Q = self.Q
-        self.value_proj = nn.Linear(2, Q)
-        # Time frequencies log-spaced from 1 to ~50
-        freqs = torch.exp(torch.linspace(0.0, math.log(50.0), Q // 2 if Q > 1 else 1))
-        if Q % 2 == 1:
-            freqs = torch.cat([freqs, freqs[:1]])
-        self.time_freq = nn.Parameter(freqs[:Q])
-        self.var_emb = nn.Embedding(n_vars, Q)
-        nn.init.normal_(self.var_emb.weight, std=0.1)
-        self.spike_proj = nn.Linear(1, Q)
-        self.mixer = QuaternionLinear(d_model, d_model)
-        self.mixer.init_identity()  # start as identity, learn to mix
+        self.num_heads = num_heads
+        self.n_dim = n_dim
+        self.fc_q = nn.Linear(dim_Q, n_dim)
+        self.fc_k = nn.Linear(dim_K, n_dim)
+        self.fc_v = nn.Linear(dim_K, n_dim)
+        if ln:
+            self.ln0 = nn.LayerNorm(dim_V)
+            self.ln1 = nn.LayerNorm(dim_V)
+        self.fc_o = nn.Linear(n_dim, n_dim)
 
-    def forward(self, value: Tensor, time_norm: Tensor, var_id: Tensor,
-                spike: Tensor, mask: Tensor):
-        # R: value
-        r = self.value_proj(torch.stack([value * mask, mask], dim=-1))
-        # I: time phases — half sin / half cos to fill Q dim
-        t_phase = time_norm.unsqueeze(-1) * self.time_freq        # [B,N,Q]
-        Q = self.Q
-        half = Q // 2
-        if half > 0:
-            i_part = torch.cat(
-                [torch.sin(t_phase[..., :half]),
-                 torch.cos(t_phase[..., half:half * 2])],
-                dim=-1,
-            )
-            if Q % 2 == 1:
-                i_part = torch.cat(
-                    [i_part, torch.sin(t_phase[..., -1:])], dim=-1)
-        else:
-            i_part = torch.sin(t_phase)
-        # Pad/truncate to Q
-        if i_part.shape[-1] != Q:
-            i_part = i_part[..., :Q] if i_part.shape[-1] > Q \
-                else F.pad(i_part, (0, Q - i_part.shape[-1]))
-        # J: variable
-        j = self.var_emb(var_id)
-        # K: spike
-        k = self.spike_proj(spike.unsqueeze(-1))
-        q = quaternion_concat(r, i_part, j, k)
-        return self.mixer(q) * mask.unsqueeze(-1)
+    def forward(self, Q, K, mask=None):
+        Q = self.fc_q(Q)
+        K, V = self.fc_k(K), self.fc_v(K)
+        ds = self.n_dim // self.num_heads
+        Q_ = torch.cat(Q.split(ds, 2), 0)
+        K = torch.cat(K.split(ds, 2), 0)
+        V = torch.cat(V.split(ds, 2), 0)
+        A = Q_.bmm(K.transpose(1, 2)) / math.sqrt(self.n_dim)
+        if mask is not None:
+            A = A.masked_fill(mask.repeat(self.num_heads, 1, 1) == 0, -1e9)
+        A = torch.softmax(A, 2)
+        O = torch.cat((Q_ + A.bmm(V)).split(Q.size(0), 0), 2)
+        O = O if getattr(self, 'ln0', None) is None else self.ln0(O)
+        O = O + F.relu(self.fc_o(O))
+        O = O if getattr(self, 'ln1', None) is None else self.ln1(O)
+        return O
 
 
 # ============================================================================
-# Layer 0 — Primary Edges (per-observation self-loop)
+# IrregularityAwareAttention (identical to SQHyper / HyperIMTS)
 # ============================================================================
 
-
-class PrimaryLayer(nn.Module):
-    """Per-cell quaternion residual transform.
-
-    Each cell n has its own self-loop edge e_n = {n}. The "message" from
-    this edge is simply a learned quaternion transform of q_n itself.
-    Guarantees no per-observation information is lost regardless of how
-    Layer 1/2 cluster cells.
-    """
-
-    def __init__(self, d_model: int):
+class IrregularityAwareAttention(nn.Module):
+    def __init__(self, d_model):
         super().__init__()
-        self.proj = QuaternionLinear(d_model, d_model)
+        self.query_proj = nn.Linear(d_model, d_model)
+        self.key_proj = nn.Linear(d_model, d_model)
+        self.value_proj = nn.Linear(d_model, d_model)
+        self.scale = d_model ** 0.5
+        self.threshold = nn.Parameter(torch.tensor(0.5), requires_grad=True)
 
-    def forward(self, q_rot: Tensor) -> Tensor:
-        return self.proj(q_rot)
+    def forward(self, x, query_aux=None, key_aux=None,
+                adjacency_mask=None, merge_coefficients=None):
+        query = self.query_proj(x)
+        key = self.key_proj(x)
+        value = self.value_proj(x)
+        attention_scores = torch.matmul(
+            query, key.transpose(-2, -1)) / self.scale
+        mask_value = torch.finfo(attention_scores.dtype).min
+        if query_aux is not None and key_aux is not None:
+            attention_scores_aux = torch.matmul(
+                query_aux, key_aux.transpose(-2, -1)) / (
+                    key_aux.shape[-1] ** 0.5)
+            non_zero_mask = (attention_scores_aux != 0)
+            positive_mask = (attention_scores > self.threshold)
+            mask = positive_mask & non_zero_mask
+            attention_scores[mask] = (
+                (1 - merge_coefficients) * attention_scores
+                + merge_coefficients * attention_scores_aux)[mask]
+        if adjacency_mask is not None:
+            attention_scores = attention_scores.masked_fill(
+                adjacency_mask == 0, mask_value)
+        attention_weights = torch.softmax(attention_scores, dim=-1)
+        return torch.matmul(attention_weights, value)
 
 
 # ============================================================================
-# Layer 2 — Quaternion Anchor Edges (global pattern)
+# HypergraphEncoder (identical to SQHyper / HyperIMTS)
 # ============================================================================
 
-
-class QuaternionAnchorLayer(nn.Module):
-    """K_a learnable quaternion anchors with quaternion-distance incidence.
-
-    Forward:
-        d[k, n]   = ||q_n_rot ⊗ conj(Q_k)||²              # quaternion distance
-        I[k, n]   = exp(-d[k, n] / σ_k²) · mask[n]
-        h_k       = QLin_aggr( Σ_n I[k, n]·q_n_rot / Σ I + ε )
-        msg_n     = QHA(query=q_n_rot, key=h_k, value=h_k)  # Hamilton attention
-    """
-
-    def __init__(self, d_model: int, k_a: int, num_heads: int = 1):
+class HypergraphEncoder(nn.Module):
+    def __init__(self, enc_in, time_length, d_model):
         super().__init__()
+        self.enc_in = enc_in
         self.d_model = d_model
-        self.k_a = k_a
-        # Anchors: random init, will learn
-        self.anchors = nn.Parameter(torch.empty(k_a, d_model))
-        nn.init.normal_(self.anchors, std=0.5)
-        self.log_sigma = nn.Parameter(torch.zeros(k_a))  # init σ=1
-        self.aggr_proj = QuaternionLinear(d_model, d_model)
-        self.attn = QuaternionMHA(d_model, num_heads=num_heads)
+        self.variable_hyperedge_weights = nn.Parameter(
+            torch.randn(enc_in, d_model), requires_grad=True)
+        self.relu = nn.ReLU()
+        self.observation_node_encoder = nn.Linear(2, d_model)
+        self.temporal_hyperedge_encoder = nn.Linear(1, d_model)
 
-    def forward(self, q_rot: Tensor, mask: Tensor) -> Tensor:
-        """
-        q_rot : [B, N, D] quaternion cell states (post-SQC)
-        mask  : [B, N]
-        Returns: msg [B, N, D]
-        """
-        B, N, D = q_rot.shape
-        K_a = self.k_a
-        # Broadcast anchors over batch: [B, K_a, D]
-        anchors_b = self.anchors.unsqueeze(0).expand(B, K_a, D)
+    def forward(self, x_L_flattened, x_y_mask_flattened, y_mask_L_flattened,
+                x_y_mark, variable_indices_flattened,
+                time_indices_flattened, N_OBSERVATIONS_MAX):
+        B = x_L_flattened.shape[0]
+        E, L, D = self.enc_in, x_y_mark.shape[1], self.d_model
+        N = N_OBSERVATIONS_MAX
 
-        # Compute pairwise quaternion distance: [B, K_a, N]
-        # ||q_n ⊗ conj(Q_k)||² = ||q_n||² + ||Q_k||² - 2·Re(q_n·conj(Q_k))
-        # = ||q||² + ||Q||² - 2·dot(q, Q) (since Re of Hamilton equals dot)
-        # We'll use the explicit formula via Hamilton product to keep
-        # quaternion semantics in code.
-        # Memory: O(B * K_a * N * D). For HA N=12k, K_a=16, D=128 -> 25M floats. OK.
-        q_exp = q_rot.unsqueeze(1).expand(B, K_a, N, D)
-        a_exp = anchors_b.unsqueeze(2).expand(B, K_a, N, D)
-        prod = hamilton_product(q_exp, quaternion_conjugate(a_exp))
-        d = prod.pow(2).sum(dim=-1)                                 # [B,K_a,N]
+        x_L_flattened = torch.stack([
+            x_L_flattened, 1 - x_y_mask_flattened + y_mask_L_flattened
+        ], dim=-1)
 
-        sigma_sq = torch.exp(self.log_sigma).pow(2).clamp_min(1e-6)  # [K_a]
-        incid = torch.exp(-d / sigma_sq.view(1, K_a, 1))             # [B,K_a,N]
-        incid = incid * mask.unsqueeze(1)
+        temporal_incidence_matrix = repeat(
+            time_indices_flattened, "B N -> B L N", L=L)
+        temporal_incidence_matrix = (temporal_incidence_matrix == repeat(
+            torch.ones(B, L, device=x_L_flattened.device).cumsum(dim=1),
+            "B L -> B L N", N=N) - 1).float()
+        temporal_incidence_matrix = temporal_incidence_matrix * repeat(
+            x_y_mask_flattened, "B N -> B L N", L=L)
 
-        # Aggregate cells -> anchors (weighted mean of quaternion states)
-        denom = incid.sum(dim=-1, keepdim=True).clamp_min(1e-6)      # [B,K_a,1]
-        h = torch.bmm(incid, q_rot) / denom                          # [B,K_a,D]
-        h = self.aggr_proj(h)
+        variable_incidence_matrix = repeat(
+            torch.ones(B, E, device=x_L_flattened.device).cumsum(dim=1) - 1,
+            "B E -> B E N", N=N)
+        variable_incidence_matrix = (variable_incidence_matrix == repeat(
+            variable_indices_flattened, "B N -> B E N", E=E)).float()
+        variable_incidence_matrix = variable_incidence_matrix * repeat(
+            x_y_mask_flattened, "B N -> B E N", E=E)
 
-        # Hamilton-product attention back to cells
-        msg = self.attn(query=q_rot, key=h, value=h)                 # [B,N,D]
-        return msg
+        observation_nodes = self.relu(
+            self.observation_node_encoder(x_L_flattened)) * repeat(
+            x_y_mask_flattened, "B N -> B N D", D=D)
+        temporal_hyperedges = torch.sin(
+            self.temporal_hyperedge_encoder(x_y_mark))
+        variable_hyperedges = self.relu(repeat(
+            self.variable_hyperedge_weights, "E D -> B E D", B=B))
+
+        return (observation_nodes, temporal_hyperedges, variable_hyperedges,
+                temporal_incidence_matrix, variable_incidence_matrix)
 
 
 # ============================================================================
-# Layer 1 — Spike-Triggered Event Edges (dynamic)
+# HypergraphLearner (SQHyper backbone + SRI + SQC)
 # ============================================================================
 
-
-class SpikeTriggeredEventLayer(nn.Module):
-    """Top-K spike-triggered dynamic hyperedges with windowed incidence.
-
-    Per forward pass:
-        1. trigger_idx = topk(spike_eff·mask, K_e)
-        2. event edge h_k seeded from QLin(q_{trigger_k}_rot)
-        3. aggregate from cells in (t_n - t_k) ∈ [0, Δt_aggr] window,
-           weighted by spike[n] · exp(-(t_n-t_k)/τ_r)
-        4. distribute back to cells in (|t_n - t_k|) ≤ Δt_dist window
-           via Hamilton-product attention
+class HypergraphLearner(nn.Module):
+    """SQHyper's HypergraphLearner with two SQHH substitutions:
+      - SGI  -> SRI  (refractory inhibition per variable)
+      - SQC  inserted before each layer's node2hyperedge attention
     """
 
-    def __init__(self, d_model: int, k_e: int = 32,
-                 dt_aggr: float = 0.05, dt_dist: float = 0.1,
-                 num_heads: int = 1):
+    def __init__(self, n_layers, d_model, n_heads, time_length, n_vars,
+                 no_sri=False, no_sqc=False, no_qmf=False):
         super().__init__()
+        self.n_layers = n_layers
         self.d_model = d_model
-        self.k_e = k_e
-        # Window sizes (relative to normalized time in [0,1]); learnable
-        self.log_dt_aggr = nn.Parameter(torch.tensor(math.log(dt_aggr)))
-        self.log_dt_dist = nn.Parameter(torch.tensor(math.log(dt_dist)))
-        self.seed_proj = QuaternionLinear(d_model, d_model)
-        self.aggr_proj = QuaternionLinear(d_model, d_model)
-        self.attn = QuaternionMHA(d_model, num_heads=num_heads)
+        self.activation = nn.ReLU()
+        self.no_sri = bool(no_sri)
+        self.no_sqc = bool(no_sqc)
+        self.no_qmf = bool(no_qmf)
+        D = d_model
+        Q = D // 4
 
-    def forward(self, q_rot: Tensor, spike: Tensor, time_norm: Tensor,
-                var_id: Tensor, mask: Tensor) -> Tensor:
-        """
-        q_rot     : [B, N, D]
-        spike     : [B, N]
-        time_norm : [B, N]
-        var_id    : [B, N]
-        mask      : [B, N]
-        Returns:  msg [B, N, D]
-        """
-        B, N, D = q_rot.shape
-        if N == 0 or self.k_e == 0:
-            return torch.zeros_like(q_rot)
-        K_e = min(self.k_e, N)
+        # === HyperIMTS/SQHyper core attention blocks ===
+        self.node2temporal_hyperedge = nn.ModuleList([
+            MultiHeadAttentionBlock(D, 2 * D, 2 * D, D, n_heads)
+            for _ in range(n_layers)])
+        self.node2variable_hyperedge = nn.ModuleList([
+            MultiHeadAttentionBlock(D, 2 * D, 2 * D, D, n_heads)
+            for _ in range(n_layers)])
+        self.node_self_update = nn.ModuleList([
+            MultiHeadAttentionBlock(D, 3 * D, 3 * D, D, n_heads)
+            for _ in range(n_layers)])
+        self.variable_hyperedge2variable_hyperedge = IrregularityAwareAttention(D)
+        self.hyperedge2hyperedge_layers = [n_layers - 1]
+        self.scale = 1 / time_length
+        self.oom_flag = False
 
-        # --- 1. Trigger selection: top-K_e cells by spike (excluding padding)
-        spike_for_topk = spike * mask                          # padding gets 0
-        _, idx = torch.topk(spike_for_topk, K_e, dim=1)        # [B, K_e]
+        # === SRI (replaces SGI) — per layer ===
+        # If no_sri is True we still use SpikeRefractoryIncidence but disable
+        # its refractory term, making it identical to SGI.
+        self.sri = nn.ModuleList([
+            SpikeRefractoryIncidence(D, n_vars, no_refractory=self.no_sri)
+            for _ in range(n_layers)])
+        # Per-layer gate scale (same residual-gating trick as SQHyper):
+        # gating = mask + gate_scale * (g_n - mask). gate_scale = 0 at init.
+        self.gate_scale = nn.ParameterList([
+            nn.Parameter(torch.zeros(1)) for _ in range(n_layers)])
 
-        # Gather trigger info
-        gather_idx_d = idx.unsqueeze(-1).expand(B, K_e, D)
-        q_seed = torch.gather(q_rot, 1, gather_idx_d)          # [B, K_e, D]
-        t_seed = torch.gather(time_norm, 1, idx)               # [B, K_e]
-        var_seed = torch.gather(var_id, 1, idx)                # [B, K_e]
+        # === SQC — one rotation per layer ===
+        if not self.no_sqc:
+            self.sqc = nn.ModuleList([
+                SpikeQuaternionRotation() for _ in range(n_layers)])
 
-        # Initial event-edge state
-        h_event = self.seed_proj(q_seed)                       # [B, K_e, D]
+        # === QMF (Quaternion Multi-Source Fusion) — identical to SQHyper ===
+        self.proj_R = nn.ModuleList([
+            nn.Linear(D, Q) for _ in range(n_layers)])
+        self.proj_I = nn.ModuleList([
+            nn.Linear(D, Q) for _ in range(n_layers)])
+        self.proj_J = nn.ModuleList([
+            nn.Linear(D, Q) for _ in range(n_layers)])
+        self.quat_h2n = nn.ModuleList()
+        for _ in range(n_layers):
+            ql = QuaternionLinear(D, D)
+            ql.init_identity()
+            self.quat_h2n.append(ql)
+        self.linear_h2n = nn.ModuleList([
+            nn.Linear(D, D) for _ in range(n_layers)])
 
-        # --- 2. Aggregation incidence: cells -> events
-        # Window: t_n - t_k ∈ [-dt_aggr/2, +dt_aggr/2]
-        # (We use absolute time difference so events grab both directions.)
-        dt_aggr = torch.exp(self.log_dt_aggr).clamp(min=1e-3, max=1.0)
-        t_n = time_norm.unsqueeze(1)                           # [B, 1, N]
-        t_k = t_seed.unsqueeze(2)                              # [B, K_e, 1]
-        delta = (t_n - t_k).abs()                              # [B, K_e, N]
-        in_window_aggr = (delta <= dt_aggr).float()
-        # Decay kernel; tau ≈ dt_aggr / 2 makes weight small at window edge
-        decay_aggr = torch.exp(-2.0 * delta / dt_aggr.clamp_min(1e-3))
-        # Variable affinity: same-variable boost (1.0); cross-variable gets 0.5
-        same_var = (var_id.unsqueeze(1) == var_seed.unsqueeze(2)).float()
-        var_aff = 0.5 + 0.5 * same_var                          # [B, K_e, N]
-        # Spike-weighted incidence
-        incid_aggr = (
-            in_window_aggr * decay_aggr * var_aff
-            * spike.unsqueeze(1) * mask.unsqueeze(1)
-        )                                                        # [B, K_e, N]
+    def get_fine_grained_embedding(self, tensor_flattened, target_shape):
+        B, L, E = target_shape.shape
+        D = tensor_flattened.shape[-1]
+        nd = max(1, int(D * self.scale))
+        tf = tensor_flattened[:, :, :nd]
+        mask = (target_shape > 0).unsqueeze(-1).expand(-1, -1, -1, nd)
+        result = torch.zeros(B, L, E, nd, dtype=tf.dtype, device=tf.device)
+        result.masked_scatter_(mask, tf)
+        return rearrange(result, "B L E D -> B E (L D)")
 
-        denom = incid_aggr.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        h_event = h_event + self.aggr_proj(
-            torch.bmm(incid_aggr, q_rot) / denom
-        )
+    def forward(self, observation_nodes, temporal_hyperedges, variable_hyperedges,
+                time_indices_flattened, variable_indices_flattened,
+                temporal_incidence_matrix, variable_incidence_matrix,
+                x_y_mask_flattened, x_y_mask, y_mask_L_flattened,
+                time_norm):
+        D = self.d_model
+        Q = D // 4
 
-        # --- 3. Distribution back to cells via Hamilton-product attention
-        dt_dist = torch.exp(self.log_dt_dist).clamp(min=1e-3, max=1.0)
-        in_window_dist = (delta <= dt_dist).float()              # [B,K_e,N]
-        # Distribution mask must match attention mask shape [B, Nq, Nk]
-        # Here Nq = N (cells), Nk = K_e (events)
-        attn_mask = in_window_dist.transpose(1, 2)               # [B, N, K_e]
-        attn_mask = attn_mask * mask.unsqueeze(-1)               # mask out padding
+        for i in range(self.n_layers):
+            if i == 0:
+                mask_temp = 1 - repeat(
+                    y_mask_L_flattened, "B N -> B L N",
+                    L=temporal_incidence_matrix.shape[1])
+                mask_temp[mask_temp == 0] = 1e-8
 
-        msg = self.attn(query=q_rot, key=h_event, value=h_event,
-                        mask=attn_mask)
-        return msg
+            # --------- Step 1: SRI — Spike-Refractory Incidence ---------
+            g_n, e_n = self.sri[i](
+                observation_nodes, x_y_mask_flattened,
+                variable_incidence_matrix, variable_indices_flattened,
+                time_norm)
+
+            # --------- Step 1.5: SQC — spike-driven rotation ---------
+            # Rotate observation_nodes by theta proportional to spike before
+            # computing gated K/V for n2h attention. Geometric effect.
+            if not self.no_sqc:
+                obs_rotated = self.sqc[i](observation_nodes, g_n)
+            else:
+                obs_rotated = observation_nodes
+
+            # --------- Step 2: residual spike gating (mask + scale*(g-mask)) ---------
+            gs = self.gate_scale[i]
+            mask_2d = x_y_mask_flattened.unsqueeze(-1)
+            gating = mask_2d + gs * (g_n.unsqueeze(-1) - mask_2d)
+            obs_gated = obs_rotated * gating
+
+            # --------- Step 3: Node -> Temporal hyperedge ---------
+            temporal_hyperedges = self.node2temporal_hyperedge[i](
+                temporal_hyperedges,
+                torch.cat([
+                    variable_hyperedges.gather(
+                        1, repeat(variable_indices_flattened,
+                                  "B N -> B N D", D=D)),
+                    obs_gated,
+                ], -1),
+                temporal_incidence_matrix
+                if i != 0 else temporal_incidence_matrix * mask_temp)
+
+            if i == 0:
+                mask_temp = 1 - repeat(
+                    y_mask_L_flattened, "B N -> B E N",
+                    E=variable_incidence_matrix.shape[1])
+                mask_temp[mask_temp == 0] = 1e-8
+
+            # --------- Step 4: Node -> Variable hyperedge ---------
+            variable_hyperedges = self.node2variable_hyperedge[i](
+                variable_hyperedges,
+                torch.cat([
+                    temporal_hyperedges.gather(
+                        1, repeat(time_indices_flattened,
+                                  "B N -> B N D", D=D)),
+                    obs_gated,
+                ], -1),
+                variable_incidence_matrix
+                if i != 0 else variable_incidence_matrix * mask_temp)
+
+            # --------- Step 5: Hyperedge -> Node via QMF ---------
+            tg = temporal_hyperedges.gather(
+                1, repeat(time_indices_flattened, "B N -> B N D", D=D))
+            vg = variable_hyperedges.gather(
+                1, repeat(variable_indices_flattened, "B N -> B N D", D=D))
+
+            if not self.oom_flag:
+                try:
+                    obs_for_h2n = self.node_self_update[i](
+                        observation_nodes,
+                        torch.cat([tg, vg, observation_nodes], -1),
+                        x_y_mask_flattened.unsqueeze(2)
+                        * x_y_mask_flattened.unsqueeze(1))
+                except:
+                    self.oom_flag = True
+                    logger.warning(
+                        "SQHH: CUDA OOM in self-attention, using fallback.")
+
+            if self.oom_flag:
+                obs_for_h2n = observation_nodes
+
+            q_R = self.proj_R[i](obs_for_h2n)
+            q_I = self.proj_I[i](tg)
+            q_J = self.proj_J[i](vg)
+            q_K = e_n
+            q = torch.cat([q_R, q_I, q_J, q_K], dim=-1)
+
+            if not self.no_qmf:
+                h2n_out = self.quat_h2n[i](q)
+            else:
+                h2n_out = self.linear_h2n[i](q)
+
+            md = repeat(x_y_mask_flattened, "B N -> B N D", D=D)
+            observation_nodes = self.activation((observation_nodes + h2n_out) * md)
+
+            # --------- Step 6: Hyperedge <-> Hyperedge (last layer only) ---------
+            if i in self.hyperedge2hyperedge_layers:
+                sync_mask = x_y_mask
+                qk = self.get_fine_grained_embedding(observation_nodes, sync_mask)
+                mc = sync_mask.transpose(-1, -2) @ sync_mask
+                nopv = mc.diagonal(0, -2, -1)
+                mc[nopv != 0] = (mc / repeat(
+                    nopv, "B E -> B E E2", E2=sync_mask.shape[-1]))[nopv != 0]
+                variable_hyperedges = (
+                    variable_hyperedges
+                    + self.variable_hyperedge2variable_hyperedge(
+                        x=variable_hyperedges,
+                        query_aux=qk, key_aux=qk,
+                        merge_coefficients=mc))
+
+        return observation_nodes, temporal_hyperedges, variable_hyperedges
 
 
 # ============================================================================
-# SQHH Block: 3-layer message passing per "round" of hypergraph reasoning
+# Main Model
 # ============================================================================
-
-
-class SQHHBlock(nn.Module):
-    """One SQHH block: SQC rotation -> L0 + L1 + L2 -> mix -> norm + residual."""
-
-    def __init__(self, d_model: int, n_vars: int, k_a: int, k_e: int,
-                 num_heads: int = 1, no_layer0: bool = False,
-                 no_layer1: bool = False, no_layer2: bool = False,
-                 no_sqc: bool = False):
-        super().__init__()
-        self.no_layer0 = no_layer0
-        self.no_layer1 = no_layer1
-        self.no_layer2 = no_layer2
-        self.no_sqc = no_sqc
-
-        if not no_sqc:
-            self.sqc = SpikeQuaternionRotation()
-        if not no_layer0:
-            self.layer0 = PrimaryLayer(d_model)
-        if not no_layer1:
-            self.layer1 = SpikeTriggeredEventLayer(d_model, k_e=k_e,
-                                                    num_heads=num_heads)
-        if not no_layer2:
-            self.layer2 = QuaternionAnchorLayer(d_model, k_a=k_a,
-                                                 num_heads=num_heads)
-
-        # Per-layer mixing weights (softplus to stay positive)
-        self.w0 = nn.Parameter(torch.tensor(0.5))
-        self.w1 = nn.Parameter(torch.tensor(0.5))
-        self.w2 = nn.Parameter(torch.tensor(0.5))
-        self.norm = QuaternionLayerNorm(d_model)
-        self.dropout = nn.Dropout(0.1)
-
-    def forward(self, q: Tensor, spike: Tensor, time_norm: Tensor,
-                var_id: Tensor, mask: Tensor) -> Tensor:
-        # SQC rotation (or identity if disabled)
-        q_rot = self.sqc(q, spike) if not self.no_sqc else q
-
-        # Per-layer messages
-        msgs = []
-        weights = []
-        if not self.no_layer0:
-            msgs.append(self.layer0(q_rot))
-            weights.append(F.softplus(self.w0))
-        if not self.no_layer1:
-            msgs.append(self.layer1(q_rot, spike, time_norm, var_id, mask))
-            weights.append(F.softplus(self.w1))
-        if not self.no_layer2:
-            msgs.append(self.layer2(q_rot, mask))
-            weights.append(F.softplus(self.w2))
-
-        if not msgs:
-            # All layers ablated; just return q (degenerate identity block)
-            return q
-
-        # Weighted sum
-        msg_total = sum(w * m for w, m in zip(weights, msgs))
-        msg_total = self.dropout(msg_total)
-        return self.norm(q + msg_total) * mask.unsqueeze(-1)
-
-
-# ============================================================================
-# Main SQHH Model
-# ============================================================================
-
 
 class Model(nn.Module):
-    """SQHH-Net: Spike-Quaternion Heterogeneous Hypergraph for IMTS."""
+    """SQHH v2: SQHyper backbone + SRI + SQC."""
 
     def __init__(self, configs: ExpConfigs):
         super().__init__()
         self.configs = configs
+        self.enc_in = configs.enc_in
         D = (configs.d_model // 4) * 4
         if D != configs.d_model:
-            logger.warning(f"SQHH: d_model {configs.d_model} -> {D} (×4)")
+            logger.warning(
+                f"SQHH: d_model {configs.d_model} -> {D} (must be ×4)")
         self.d_model = D
-        self.enc_in = configs.enc_in
-        self.n_layers = configs.n_layers
 
         sl = configs.seq_len_max_irr or configs.seq_len
         pl = configs.pred_len_max_irr or configs.pred_len
-        self.L_total = sl + pl
+        tl = sl + pl
 
-        # Hyperparameters
-        self.k_a = int(getattr(configs, "sqhh_k_a", 16))
-        self.k_e = int(getattr(configs, "sqhh_k_e", 32))
-        self.no_layer0 = bool(int(getattr(configs, "sqhh_no_layer0", 0)))
-        self.no_layer1 = bool(int(getattr(configs, "sqhh_no_layer1", 0)))
-        self.no_layer2 = bool(int(getattr(configs, "sqhh_no_layer2", 0)))
-        self.no_sra = bool(int(getattr(configs, "sqhh_no_sra", 0)))
-        self.no_sqc = bool(int(getattr(configs, "sqhh_no_sqc", 0)))
-        spike_floor = float(getattr(configs, "sqhh_spike_floor", 0.0))
+        # Ablation flags (accept both new sqhh_* names and legacy ones)
+        no_sri = bool(int(getattr(configs, "sqhh_no_sri", 0)))
+        no_sqc = bool(int(getattr(configs, "sqhh_no_sqc", 0)))
+        no_qmf = bool(int(getattr(configs, "sqhh_no_qmf",
+                                   getattr(configs, "sqhyper_no_qmf", 0))))
 
-        # Encoder
-        self.spike_encoder = SpikeRefractoryEncoder(
-            n_vars=self.enc_in, d_model=D, floor=spike_floor,
-            no_refractory=self.no_sra,
-        )
-        self.cell_encoder = QuaternionCellEncoder(
-            d_model=D, n_vars=self.enc_in)
+        self.hypergraph_encoder = HypergraphEncoder(
+            self.enc_in, tl, D)
+        self.hypergraph_learner = HypergraphLearner(
+            configs.n_layers, D, configs.n_heads, tl, self.enc_in,
+            no_sri=no_sri, no_sqc=no_sqc, no_qmf=no_qmf)
+        self.hypergraph_decoder = nn.Linear(3 * D, 1)
 
-        # Stack of SQHH blocks
-        self.blocks = nn.ModuleList([
-            SQHHBlock(
-                d_model=D, n_vars=self.enc_in,
-                k_a=self.k_a, k_e=self.k_e,
-                num_heads=configs.n_heads,
-                no_layer0=self.no_layer0,
-                no_layer1=self.no_layer1,
-                no_layer2=self.no_layer2,
-                no_sqc=self.no_sqc,
-            )
-            for _ in range(self.n_layers)
-        ])
-
-        # Decoder: HyperIMTS-style gather of time/variable hyperedge summaries.
-        # Instead of learning per-timestep hyperedges via message passing (which
-        # would require a full SQHyper backbone), we derive them by spike-weighted
-        # scatter-mean aggregation of the final quaternion cell states. This
-        # gives the decoder the critical 'what else was happening at this cell's
-        # time / variable' context that HyperIMTS / SQHyper rely on, while letting
-        # spike directly gate each cell's contribution to its time / variable
-        # bucket -- a mechanism not present in HyperIMTS.
-        dec_in_dim = 4 * D  # q_final | q_init | time_summary | var_summary
-        self.decoder = nn.Sequential(
-            nn.Linear(dec_in_dim, D), nn.GELU(), nn.Dropout(0.1),
-            nn.Linear(D, D // 2), nn.GELU(),
-            nn.Linear(D // 2, 1),
-        )
-
-        # Diagnostic
+        # Diagnostic: track spike sparsity and refractory activity
         self.diag_interval = int(getattr(configs, "sqhh_diag_interval", 0))
         self.register_buffer(
             "_diag_step", torch.zeros(1, dtype=torch.long), persistent=False)
-
-    # ---- helpers (shared with HyperIMTS / SQHyper / STHQ) ---------------
-
-    def _gather_summaries(self, q: Tensor, mask: Tensor, spike: Tensor,
-                           time_id: Tensor, var_id: Tensor,
-                           L: int, V: int):
-        """Spike-weighted time / variable hyperedge summaries.
-
-        For each cell, gather the weighted-mean quaternion state over:
-          - all cells sharing the same time index (time_summary)
-          - all cells sharing the same variable index (var_summary)
-
-        Weight w = mask * (1 + spike) makes padded cells contribute 0 and
-        high-spike cells dominate their bucket. This restores HyperIMTS's
-        hyperedge-gather mechanism at decode time while giving spike a direct,
-        contextful role.
-
-        Args:
-          q:        [B, N, D] final quaternion cell states
-          mask:     [B, N] 0/1
-          spike:    [B, N] in [0, 1]
-          time_id:  [B, N] long in [0, L)
-          var_id:   [B, N] long in [0, V)
-
-        Returns:
-          time_ctx: [B, N, D] — per-cell time-bucket summary, broadcast back
-          var_ctx:  [B, N, D] — per-cell variable-bucket summary, broadcast back
-        """
-        B, N, D = q.shape
-        w = (mask * (1.0 + spike)).unsqueeze(-1)  # [B, N, 1]
-        qw = q * w  # [B, N, D]
-
-        # ----- time bucket -----
-        t_idx = time_id.clamp(0, L - 1).unsqueeze(-1)  # [B, N, 1]
-        t_num = torch.zeros(B, L, D, device=q.device, dtype=q.dtype)
-        t_den = torch.zeros(B, L, 1, device=q.device, dtype=q.dtype)
-        t_num.scatter_add_(1, t_idx.expand(-1, -1, D), qw)
-        t_den.scatter_add_(1, t_idx, w)
-        t_sum = t_num / t_den.clamp_min(1e-6)  # [B, L, D]
-        time_ctx = t_sum.gather(1, t_idx.expand(-1, -1, D))  # [B, N, D]
-
-        # ----- variable bucket -----
-        v_idx = var_id.clamp(0, V - 1).unsqueeze(-1)  # [B, N, 1]
-        v_num = torch.zeros(B, V, D, device=q.device, dtype=q.dtype)
-        v_den = torch.zeros(B, V, 1, device=q.device, dtype=q.dtype)
-        v_num.scatter_add_(1, v_idx.expand(-1, -1, D), qw)
-        v_den.scatter_add_(1, v_idx, w)
-        v_sum = v_num / v_den.clamp_min(1e-6)  # [B, V, D]
-        var_ctx = v_sum.gather(1, v_idx.expand(-1, -1, D))  # [B, N, D]
-
-        return time_ctx, var_ctx
 
     def pad_and_flatten(self, tensor, mask, max_len):
         B = tensor.shape[0]
@@ -828,20 +660,19 @@ class Model(nn.Module):
     def unpad_and_reshape(self, tensor_flattened, original_mask, original_shape):
         original_mask = original_mask.bool()
         device = tensor_flattened.device
-        result = torch.zeros(original_shape, dtype=tensor_flattened.dtype,
-                             device=device)
-        counts = original_mask.sum(dim=tuple(range(1, original_mask.dim())))
+        result = torch.zeros(original_shape,
+                              dtype=tensor_flattened.dtype, device=device)
+        counts = original_mask.sum(
+            dim=tuple(range(1, original_mask.dim())))
         batch_size, max_len = tensor_flattened.shape[:2]
-        steps = torch.arange(max_len, device=device).expand(batch_size, max_len)
+        steps = torch.arange(max_len, device=device).expand(
+            batch_size, max_len)
         src_mask = steps < counts.unsqueeze(-1)
         result[original_mask] = tensor_flattened[src_mask]
         return result
 
-    # ---- forward --------------------------------------------------------
-
     def forward(self, x, x_mark=None, x_mask=None, y=None, y_mark=None,
-                y_mask=None,
-                x_L_flattened=None, x_y_mask_flattened=None,
+                y_mask=None, x_L_flattened=None, x_y_mask_flattened=None,
                 y_L_flattened=None, y_mask_L_flattened=None,
                 exp_stage="train", **kwargs):
         BATCH_SIZE, SEQ_LEN, ENC_IN = x.shape
@@ -853,8 +684,8 @@ class Model(nn.Module):
         if x_mask is None:
             x_mask = torch.ones_like(x, device=x.device, dtype=x.dtype)
         if y is None:
-            y = torch.ones((BATCH_SIZE, Y_LEN, ENC_IN), dtype=x.dtype,
-                           device=x.device)
+            y = torch.ones((BATCH_SIZE, Y_LEN, ENC_IN),
+                           dtype=x.dtype, device=x.device)
         if y_mark is None:
             y_mark = repeat(
                 torch.arange(end=y.shape[1], dtype=y.dtype, device=y.device)
@@ -873,11 +704,13 @@ class Model(nn.Module):
         ]:
             x_zeros = torch.zeros_like(y, dtype=x.dtype, device=x.device)
             y_zeros = torch.zeros_like(x, dtype=y.dtype, device=y.device)
+            x_y_mark = torch.cat([x_mark, y_mark], dim=1)
             x_L = torch.cat([x, x_zeros], dim=1)
             x_y_mask = torch.cat([x_mask, y_mask], dim=1)
             y_L = torch.cat([y_zeros, y], dim=1)
             y_mask_L = torch.cat([y_zeros, y_mask], dim=1)
         elif self.configs.task_name in ["imputation"]:
+            x_y_mark = x_mark
             x_L = x
             x_y_mask = x_mask + y_mask
             y_L = y
@@ -923,58 +756,58 @@ class Model(nn.Module):
             variable_indices_flattened = self.pad_and_flatten(
                 variable_indices, x_y_mask_bool, N_OBSERVATIONS_MAX)
 
+        # Normalized time for SRI refractory kernel
         time_norm = time_indices_flattened.float() / max(1, L - 1)
-        var_id = variable_indices_flattened
-        mask = x_y_mask_flattened
-        # Contribute mask: query positions don't form events (their value = 0)
-        contribute_mask = mask * (1.0 - y_mask_L_flattened)
 
-        # Compute spike (with SRA refractory) only on contributing cells
-        spike = self.spike_encoder(
-            value=x_L_flattened, time_norm=time_norm,
-            mask=contribute_mask, var_id=var_id)
-        # But for the K-component encoding, queries get 0 spike naturally
+        # Encode
+        (observation_nodes, temporal_hyperedges, variable_hyperedges,
+         temporal_incidence_matrix, variable_incidence_matrix
+         ) = self.hypergraph_encoder(
+            x_L_flattened, x_y_mask_flattened, y_mask_L_flattened,
+            x_y_mark, variable_indices_flattened,
+            time_indices_flattened, N_OBSERVATIONS_MAX)
 
-        # Encode quaternion cells
-        q_init = self.cell_encoder(
-            value=x_L_flattened, time_norm=time_norm, var_id=var_id,
-            spike=spike, mask=mask)
+        # Hypergraph learning (SRI + SQC + QMF)
+        (observation_nodes, temporal_hyperedges, variable_hyperedges
+         ) = self.hypergraph_learner(
+            observation_nodes, temporal_hyperedges, variable_hyperedges,
+            time_indices_flattened, variable_indices_flattened,
+            temporal_incidence_matrix, variable_incidence_matrix,
+            x_y_mask_flattened, x_y_mask, y_mask_L_flattened,
+            time_norm)
 
-        # SQHH blocks
-        q = q_init
-        for blk in self.blocks:
-            q = blk(q, spike, time_norm, var_id, mask)
-
-        # Spike-weighted time/variable hyperedge summaries.
-        # Aggregate per time-bucket and per variable-bucket using scatter-mean.
-        # Weight = mask * (1 + spike): padded cells get 0, high-spike cells
-        # dominate their bucket summary.
-        time_ctx, var_ctx = self._gather_summaries(
-            q=q, mask=mask, spike=spike,
-            time_id=time_indices_flattened,
-            var_id=var_id, L=L, V=ENC_IN,
-        )
-
-        decoder_input = torch.cat([q, q_init, time_ctx, var_ctx], dim=-1)
-        pred_flattened = self.decoder(decoder_input).squeeze(-1)
-
-        # Optional diagnostic
-        if self.training and self.diag_interval > 0:
-            self._diag_step += 1
-            if int(self._diag_step.item()) % self.diag_interval == 0:
-                with torch.no_grad():
-                    sm = float(spike[mask > 0].mean().item()) if mask.sum() > 0 else 0.0
-                    ss = float(spike[mask > 0].std().item()) if mask.sum() > 0 else 0.0
-                    sa = float((spike > 0.5).float().mean().item())
-                    logger.debug(
-                        f"[SQHH diag step={int(self._diag_step.item())}] "
-                        f"spike: mean={sm:.3f} std={ss:.3f} active={sa:.3f}; "
-                        f"K_a={self.k_a} K_e={self.k_e}"
-                    )
-
+        # Decode (same as SQHyper)
         if self.configs.task_name in [
             "long_term_forecast", "short_term_forecast", "imputation"
         ]:
+            D = self.d_model
+            pred_flattened = self.hypergraph_decoder(torch.cat([
+                observation_nodes,
+                temporal_hyperedges.gather(
+                    1, repeat(time_indices_flattened, "B N -> B N D", D=D)),
+                variable_hyperedges.gather(
+                    1, repeat(variable_indices_flattened, "B N -> B N D", D=D)),
+            ], dim=-1)).squeeze(-1)
+
+            # Diagnostic (optional)
+            if self.training and self.diag_interval > 0:
+                self._diag_step += 1
+                if int(self._diag_step.item()) % self.diag_interval == 0:
+                    with torch.no_grad():
+                        # Report spike stats from the last layer's SRI (by
+                        # reusing the existing gate stats is complex, so we
+                        # re-run a quick pass on the first layer).
+                        # Simple proxy: reuse x_y_mask_flattened density.
+                        obs_density = float(
+                            x_y_mask_flattened.float().mean().item())
+                        logger.debug(
+                            f"[SQHH diag step={int(self._diag_step.item())}] "
+                            f"obs_density={obs_density:.3f} "
+                            f"n_layers={self.hypergraph_learner.n_layers} "
+                            f"no_sri={self.hypergraph_learner.no_sri} "
+                            f"no_sqc={self.hypergraph_learner.no_sqc}"
+                        )
+
             if exp_stage in ["train", "val"]:
                 return {
                     "pred": pred_flattened,
@@ -985,9 +818,8 @@ class Model(nn.Module):
                 pred = self.unpad_and_reshape(
                     pred_flattened,
                     torch.cat([x_mask, y_mask], dim=1),
-                    (BATCH_SIZE, SEQ_LEN + PRED_LEN, ENC_IN),
-                )
-                f_dim = -1 if self.configs.features == "MS" else 0
+                    (BATCH_SIZE, SEQ_LEN + PRED_LEN, ENC_IN))
+                f_dim = -1 if self.configs.features == 'MS' else 0
                 return {
                     "pred": pred[:, -PRED_LEN:, f_dim:],
                     "true": y[:, :, f_dim:],

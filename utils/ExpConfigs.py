@@ -200,6 +200,8 @@ class ExpConfigs:
     sqhh_no_layer2: int
     sqhh_no_sra: int
     sqhh_no_sqc: int
+    sqhh_no_sri: int
+    sqhh_no_qmf: int
     sqhh_diag_interval: int
     # ReIMTS
     reimts_pad_time_emb: int

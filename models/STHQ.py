@@ -221,11 +221,12 @@ class CellEncoder(nn.Module):
 class STHQLayer(nn.Module):
     def __init__(self, d_model, n_vars, k_t, k_v,
                  omega_min, omega_max, layer_idx, n_layers,
-                 use_he_attn=False):
+                 use_he_attn=False, k_e=0):
         super().__init__()
         self.d_model = d_model
         self.k_t = k_t
         self.k_v = k_v
+        self.k_e = int(k_e)
         self.layer_idx = layer_idx
         self.use_he_attn = use_he_attn
 
@@ -276,6 +277,26 @@ class STHQLayer(nn.Module):
         if use_he_attn:
             self.he_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
             self.he_norm = QuaternionLayerNorm(d_model)
+
+        # ---- Spike-Triggered Event Anchors (STEA) ---------------------------
+        # When k_e > 0, the layer additionally constructs k_e DYNAMIC
+        # (per-batch) hyperedges anchored at the top-K spike-active observed
+        # cells. Captures sample-specific burst patterns that static τ
+        # anchors cannot encode. STHQ-distinct: HyperIMTS has no per-sample
+        # learned anchors; this is the "event-routed" mechanism.
+        if self.k_e > 0:
+            # Bandwidth for event kernel (smaller than static τ — events
+            # are localized).
+            self.event_omega_log = nn.Parameter(
+                torch.tensor(math.log(max(omega_min, 0.01))))
+            # How much weight cross-variable receives (1.0 = full,
+            # 0.0 = same-var only)
+            self.event_xvar_softness = nn.Parameter(torch.tensor(0.0))
+            # Quaternion projections for event hyperedge state and message
+            self.event_proj = QuaternionLinear(d_model, d_model)
+            self.event_msg_proj = QuaternionLinear(d_model, d_model)
+            # Mixing weight between (temporal+variable) and event paths
+            self.event_mix_logit = nn.Parameter(torch.tensor(-1.0))
 
     def forward(self, q, spike_intensity, time_norm, var_id, mask):
         """
@@ -351,6 +372,54 @@ class STHQLayer(nn.Module):
         msg_l = h_per_cell                             # [B, N, D] linear path
         alpha = torch.sigmoid(self.alpha_logit)
         msg = alpha * self.msg_proj_h(msg_h) + (1 - alpha) * self.msg_proj_l(msg_l)
+
+        # ---- Spike-Triggered Event Anchors (STEA) ---------------------------
+        if self.k_e > 0 and N > 0:
+            # spike used for ranking; queries excluded since spike=0 for them
+            # (and their mask=1 but spike encoder outputs 0 — verified).
+            K_e = min(self.k_e, N)
+            spike_for_rank = spike_intensity * mask  # [B, N]
+            # Top-K_e per batch
+            _, top_idx = spike_for_rank.topk(K_e, dim=1)        # [B, K_e]
+            # Gather event positions and seed states (gradient flows through q)
+            event_t = torch.gather(time_norm, 1, top_idx)        # [B, K_e]
+            event_v = torch.gather(var_id, 1, top_idx)           # [B, K_e]
+            top_idx_d = top_idx.unsqueeze(-1).expand(-1, -1, D)  # [B,K_e,D]
+            event_q = torch.gather(q, 1, top_idx_d)              # [B, K_e, D]
+
+            # Event temporal kernel (Gaussian)
+            omega_e = torch.exp(self.event_omega_log).clamp(min=1e-3)
+            diff_e = time_norm.unsqueeze(-1) - event_t.unsqueeze(1)  # [B,N,K_e]
+            k_temp_e = torch.exp(-0.5 * (diff_e / omega_e) ** 2)
+
+            # Event variable kernel: same-var=1; cross-var weighted by softness
+            same_var = (var_id.unsqueeze(-1) == event_v.unsqueeze(1)).float()
+            xvar_w = torch.sigmoid(self.event_xvar_softness)     # [0,1]
+            k_var_e = same_var + xvar_w * (1.0 - same_var)        # [B,N,K_e]
+
+            kernel_e = k_temp_e * k_var_e
+
+            # Aggregation (cell -> event hyperedge): spike-gated
+            m_aggr_e = (spike_intensity.unsqueeze(-1) * kernel_e
+                        * mask.unsqueeze(-1))
+            denom_e = m_aggr_e.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            # Hyperedge state: weighted sum of cell states
+            h_event = m_aggr_e.transpose(1, 2) @ q / denom_e.transpose(1, 2)
+            # Inject seed (event_q) information additively then quaternion mix
+            h_event = self.event_proj(h_event + event_q)
+
+            # Distribution (event hyperedge -> cell): position-only
+            m_dist_e = kernel_e * mask.unsqueeze(-1)
+            m_dist_e_norm = m_dist_e / m_dist_e.sum(
+                dim=2, keepdim=True).clamp_min(1e-6)
+            h_event_per_cell = m_dist_e_norm @ h_event           # [B,N,D]
+            msg_e = self.event_msg_proj(
+                hamilton_product(h_event_per_cell, q))
+
+            # Blend STEA into total message via learnable mixing weight
+            beta = torch.sigmoid(self.event_mix_logit)            # [0,1]
+            msg = (1 - beta) * msg + beta * msg_e
+
         msg = self.dropout(msg)
         q_new = self.norm(q + msg)
         return q_new * mask.unsqueeze(-1)
@@ -393,6 +462,19 @@ class Model(nn.Module):
             kt_per_layer = [self.k_t] * self.n_layers
         self.kt_per_layer = kt_per_layer
 
+        # ---- STEA: per-layer K_e (number of dynamic event anchors) ----------
+        # Empty / 0 → STEA disabled. Per-layer schedule like K_t.
+        self.k_e = int(getattr(configs, "sthq_k_e", 0))
+        ke_sched_str = str(getattr(configs, "sthq_k_e_per_layer", "")).strip()
+        if ke_sched_str:
+            ke_per_layer = [int(s) for s in ke_sched_str.split(",")]
+            assert len(ke_per_layer) == self.n_layers, (
+                f"sthq_k_e_per_layer has {len(ke_per_layer)} entries but "
+                f"n_layers={self.n_layers}")
+        else:
+            ke_per_layer = [self.k_e] * self.n_layers
+        self.ke_per_layer = ke_per_layer
+
         Q = D // 4
         self.spike_floor = float(getattr(configs, "sthq_spike_floor", 0.0))
         self.spike_encoder = SpikeEncoder(
@@ -407,6 +489,7 @@ class Model(nn.Module):
                 n_vars=configs.enc_in,
                 k_t=kt_per_layer[l],
                 k_v=self.k_v,
+                k_e=ke_per_layer[l],
                 omega_min=self.omega_min,
                 omega_max=self.omega_max,
                 layer_idx=l,
@@ -471,9 +554,15 @@ class Model(nn.Module):
                 gam = torch.exp(layer.spike_omega_gamma_log).item()
                 va_sm = F.softmax(layer.var_affinity, dim=-1)
                 ent = (-(va_sm * va_sm.clamp_min(1e-8).log()).sum(-1).mean()).item()
+                if layer.k_e > 0:
+                    beta = torch.sigmoid(layer.event_mix_logit).item()
+                    om_e = torch.exp(layer.event_omega_log).item()
+                    ev_str = f" K_e={layer.k_e} β={beta:.2f} ω_e={om_e:.3f}"
+                else:
+                    ev_str = ""
                 layer_stats.append(
                     f"L{l}(K_t={layer.k_t}): α={alpha:.2f} γ={gam:.2f} "
-                    f"τ_std={tau_std:.3f} ω̄={om:.3f} var_ent={ent:.2f}"
+                    f"τ_std={tau_std:.3f} ω̄={om:.3f} var_ent={ent:.2f}{ev_str}"
                 )
         logger.debug(
             f"[STHQ diag step={self._diag_step.item()}] "

@@ -205,6 +205,8 @@ def get_configs(args=None) -> ExpConfigs:
     parser.add_argument('--sthq_k_t_per_layer', type=str, default='', help='STHQ: comma-separated per-layer K_t (multi-scale). Empty = all layers share --sthq_k_t.')
     parser.add_argument('--sthq_diag_interval', type=int, default=0, help='STHQ: log spike/τ/α stats every N forward passes during training (0=disabled).')
     parser.add_argument('--sthq_spike_floor', type=float, default=0.0, help='STHQ: minimum spike intensity for observed cells (prevents starvation on sparse data, 0=disabled).')
+    parser.add_argument('--sthq_k_e', type=int, default=0, help='STHQ: number of dynamic event anchors per layer (STEA, 0=disabled).')
+    parser.add_argument('--sthq_k_e_per_layer', type=str, default='', help='STHQ: comma-separated per-layer K_e (multi-scale event anchors). Empty = all layers share --sthq_k_e.')
     # ReIMTS
     parser.add_argument('--reimts_pad_time_emb', type=int, default=1, help='Whether to pad temporal embedding')
     # ScaleFormer

@@ -35,6 +35,8 @@ class FakeConfigs:
     sthq_k_t_per_layer = ""
     sthq_diag_interval = 0
     sthq_spike_floor = 0.0
+    sthq_k_e = 0
+    sthq_k_e_per_layer = ""
 
 
 def test_kron_equivalence():
@@ -215,6 +217,43 @@ def test_spike_modulated_omega():
     print("  OK: γ present and learnable per layer")
 
 
+def test_stea():
+    """Verify STEA path: K_e>0 changes predictions, gradients flow through."""
+    print("--- STEA (Spike-Triggered Event Anchors) ---")
+    cfg = FakeConfigs()
+    cfg.sthq_k_e = 4
+    cfg.sthq_spike_floor = 0.1
+    model = Model(cfg)
+    model.train()
+    B, L, V = 2, cfg.seq_len, cfg.enc_in
+    x = torch.randn(B, L, V, requires_grad=False)
+    out_ke = model(x=x, exp_stage="train")
+    loss_ke = out_ke["true"].mean() if "true" in out_ke else out_ke["pred"].mean()
+    pred_ke = out_ke["pred"]
+    print(f"  K_e=4 pred shape={tuple(pred_ke.shape)}, std={pred_ke.std().item():.3f}")
+    # Gradient flow
+    pred_ke.mean().backward()
+    layer0 = model.layers[0]
+    assert layer0.event_proj.R.grad is not None, "STEA event_proj got no gradient"
+    assert layer0.event_msg_proj.R.grad is not None, "STEA event_msg_proj got no gradient"
+    print(f"  event_omega.grad={layer0.event_omega_log.grad.item():.4e}")
+    print(f"  event_mix_logit.grad={layer0.event_mix_logit.grad.item():.4e}")
+    print("  OK: STEA forward + backward")
+
+    # Compare with K_e=0
+    cfg2 = FakeConfigs()
+    cfg2.sthq_k_e = 0
+    cfg2.sthq_spike_floor = 0.1
+    model2 = Model(cfg2)
+    model2.eval()
+    model.eval()
+    out0 = model2(x=x, exp_stage="test")
+    out1 = model(x=x, exp_stage="test")
+    diff = (out0["pred"] - out1["pred"]).abs().max().item()
+    print(f"  K_e=0 vs K_e=4 pred max diff: {diff:.4f}")
+    assert diff > 1e-4, "STEA should change predictions"
+
+
 def test_diagnostic_logging():
     """Verify diagnostic logging triggers without error."""
     print("--- Diagnostic logging ---")
@@ -237,6 +276,7 @@ def main():
     test_multiscale_kt()
     test_spike_floor()
     test_spike_modulated_omega()
+    test_stea()
     test_diagnostic_logging()
     print("\n✅ All smoke tests passed.")
 

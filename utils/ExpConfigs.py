@@ -196,6 +196,8 @@ class ExpConfigs:
     sthq_k_t_per_layer: str
     sthq_diag_interval: int
     sthq_spike_floor: float
+    sthq_k_e: int
+    sthq_k_e_per_layer: str
     # ReIMTS
     reimts_pad_time_emb: int
     # ScaleFormer

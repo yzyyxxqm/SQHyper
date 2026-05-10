@@ -37,8 +37,8 @@ for pred_len in 3; do
     --enc_in $n_variables \
     --dec_in $n_variables \
     --c_out $n_variables \
-    --train_epochs 15 \
-    --patience 3 \
+    --train_epochs 25 \
+    --patience 4 \
     --val_interval 1 \
     --itr 1 \
     --batch_size 64 \
@@ -50,5 +50,6 @@ for pred_len in 3; do
     --sthq_omega_max 0.4 \
     --sthq_use_he_attn_from_layer 1 \
     --sthq_diag_interval 200 \
-    --sthq_spike_floor 0.2
+    --sthq_spike_floor 0.2 \
+    --sthq_k_e_per_layer "32,16,8"
 done

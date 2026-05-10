@@ -50,5 +50,6 @@ for pred_len in 3; do
     --sthq_omega_max 0.4 \
     --sthq_use_he_attn_from_layer 1 \
     --sthq_diag_interval 200 \
-    --sthq_spike_floor 0.1
+    --sthq_spike_floor 0.1 \
+    --sthq_k_e_per_layer "16,8,4"
 done

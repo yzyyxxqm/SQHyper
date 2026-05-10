@@ -37,10 +37,10 @@ for pred_len in 3; do
     --enc_in $n_variables \
     --dec_in $n_variables \
     --c_out $n_variables \
-    --train_epochs 300 \
-    --patience 10 \
+    --train_epochs 50 \
+    --patience 4 \
     --val_interval 1 \
-    --itr 5 \
+    --itr 2 \
     --batch_size 16 \
     --learning_rate 1e-3 \
     --sthq_k_t 128 \

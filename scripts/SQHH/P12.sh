@@ -42,6 +42,8 @@ for pred_len in 3; do
     --itr 5 \
     --batch_size 32 \
     --learning_rate 1e-3 \
+    --use_amp 1 \
+    --use_compile 1 \
     --sqhh_k_a 16 \
     --sqhh_k_e 32 \
     --sqhh_spike_floor 0.2 \

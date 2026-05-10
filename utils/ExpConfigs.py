@@ -191,6 +191,16 @@ class ExpConfigs:
     sthq_no_spike: int
     sthq_no_quaternion: int
     sthq_diag_interval: int
+    # SQHH: Spike-Quaternion Heterogeneous Hypergraph
+    sqhh_k_a: int
+    sqhh_k_e: int
+    sqhh_spike_floor: float
+    sqhh_no_layer0: int
+    sqhh_no_layer1: int
+    sqhh_no_layer2: int
+    sqhh_no_sra: int
+    sqhh_no_sqc: int
+    sqhh_diag_interval: int
     # ReIMTS
     reimts_pad_time_emb: int
     # ScaleFormer

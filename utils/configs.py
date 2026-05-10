@@ -200,6 +200,16 @@ def get_configs(args=None) -> ExpConfigs:
     parser.add_argument('--sthq_no_spike', type=int, default=0, help='STHQ ablation: disable SpikeEncoder (mask-only K/V gating, zero event features).')
     parser.add_argument('--sthq_no_quaternion', type=int, default=0, help='STHQ ablation: replace QMF with flat Linear(D, D) for hyperedge -> node fusion.')
     parser.add_argument('--sthq_diag_interval', type=int, default=0, help='STHQ: log spike gate / event norm / gate_scale every N forward passes during training (0=disabled).')
+    # SQHH: Spike-Quaternion Heterogeneous Hypergraph
+    parser.add_argument('--sqhh_k_a', type=int, default=16, help='SQHH: number of Layer-2 quaternion anchors (global pattern hyperedges).')
+    parser.add_argument('--sqhh_k_e', type=int, default=32, help='SQHH: number of Layer-1 spike-triggered event hyperedges per batch.')
+    parser.add_argument('--sqhh_spike_floor', type=float, default=0.0, help='SQHH: minimum effective spike intensity (after refractory inhibition).')
+    parser.add_argument('--sqhh_no_layer0', type=int, default=0, help='SQHH ablation: disable Layer 0 (per-observation primary edges).')
+    parser.add_argument('--sqhh_no_layer1', type=int, default=0, help='SQHH ablation: disable Layer 1 (spike-triggered event edges).')
+    parser.add_argument('--sqhh_no_layer2', type=int, default=0, help='SQHH ablation: disable Layer 2 (quaternion anchor edges).')
+    parser.add_argument('--sqhh_no_sra', type=int, default=0, help='SQHH ablation: disable Spike-Refractory Activation (use bare sigmoid spike).')
+    parser.add_argument('--sqhh_no_sqc', type=int, default=0, help='SQHH ablation: disable Spike-Quaternion Coupling (no rotation before message passing).')
+    parser.add_argument('--sqhh_diag_interval', type=int, default=0, help='SQHH: log spike statistics every N forward passes (0=disabled).')
     # ReIMTS
     parser.add_argument('--reimts_pad_time_emb', type=int, default=1, help='Whether to pad temporal embedding')
     # ScaleFormer

@@ -52,6 +52,29 @@ class Exp_Main(Exp_Basic):
         # dynamically import the desired model class
         model_module = importlib.import_module("models." + self.configs.model_name)
         model = model_module.Model(self.configs)
+        # Optional: wrap with torch.compile for graph optimization. Uses
+        # dynamic=True so variable-length IMTS batches don't trigger
+        # repeated recompilation; mode="default" tolerates graph breaks
+        # (e.g., the OOM try/except inside HypergraphLearner.forward).
+        # capture_scalar_outputs=True is required because IMTS models
+        # compute N_OBSERVATIONS_MAX = max(mask.sum()) -> data-dependent
+        # shape, which dynamo can't trace by default.
+        # suppress_errors=True makes failed regions fall back to eager
+        # instead of crashing the whole run.
+        if int(getattr(self.configs, "use_compile", 0)):
+            try:
+                torch._dynamo.config.capture_scalar_outputs = True
+                torch._dynamo.config.suppress_errors = True
+                model = torch.compile(model, dynamic=True, mode="default")
+                logger.info(
+                    "torch.compile enabled (dynamic=True, mode=default, "
+                    "capture_scalar_outputs=True, suppress_errors=True). "
+                    "First batch will be slow (~30-60s) due to graph capture; "
+                    "subsequent batches should run 20-40%% faster."
+                )
+            except Exception as e:
+                logger.warning(
+                    f"torch.compile failed: {e}. Falling back to eager mode.")
         return model
 
     def _get_data(self, flag: str) -> tuple[Dataset, DataLoader]:

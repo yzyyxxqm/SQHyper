@@ -37,7 +37,7 @@ for pred_len in 3; do
     --dec_in $n_variables \
     --c_out $n_variables \
     --train_epochs 300 \
-    --patience 10 \
+    --patience 25 \
     --val_interval 1 \
     --itr 5 \
     --batch_size 16 \

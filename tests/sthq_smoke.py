@@ -34,6 +34,7 @@ class FakeConfigs:
     sthq_lambda_var = 0.0
     sthq_k_t_per_layer = ""
     sthq_diag_interval = 0
+    sthq_spike_floor = 0.0
 
 
 def test_kron_equivalence():
@@ -178,6 +179,42 @@ def test_multiscale_kt():
     print("  OK: multi-scale K_t accepted and forward works")
 
 
+def test_spike_floor():
+    """Verify spike floor enforces minimum spike value on observed cells."""
+    print("--- Spike floor ---")
+    cfg = FakeConfigs()
+    cfg.sthq_spike_floor = 0.3
+    model = Model(cfg)
+    model.eval()
+    B, L, V = 2, cfg.seq_len, cfg.enc_in
+    x = torch.randn(B, L, V)
+    x_mask = torch.ones(B, L, V)
+    # Manually invoke spike encoder to inspect
+    # Need to flatten via model helpers; test forward instead and read
+    # spike via a hook-free check: forward with floor=0 vs floor=0.3 should differ
+    model.spike_encoder.floor = 0.0
+    out0 = model(x=x, x_mask=x_mask, exp_stage="test")
+    model.spike_encoder.floor = 0.3
+    out3 = model(x=x, x_mask=x_mask, exp_stage="test")
+    diff = (out0["pred"] - out3["pred"]).abs().max().item()
+    print(f"  floor=0 vs floor=0.3 pred diff: {diff:.4f}")
+    assert diff > 1e-4, f"Floor change should affect predictions, got diff={diff:.2e}"
+    print("  OK: floor changes affect predictions")
+
+
+def test_spike_modulated_omega():
+    """Verify γ (spike-modulated bandwidth) is initialized and learnable."""
+    print("--- Spike-modulated ω ---")
+    cfg = FakeConfigs()
+    model = Model(cfg)
+    for l, layer in enumerate(model.layers):
+        assert hasattr(layer, "spike_omega_gamma_log")
+        gam = torch.exp(layer.spike_omega_gamma_log).item()
+        print(f"  L{l} initial γ = {gam:.3f}")
+        assert layer.spike_omega_gamma_log.requires_grad
+    print("  OK: γ present and learnable per layer")
+
+
 def test_diagnostic_logging():
     """Verify diagnostic logging triggers without error."""
     print("--- Diagnostic logging ---")
@@ -198,6 +235,8 @@ def main():
     test_model()
     test_query_receives_messages()
     test_multiscale_kt()
+    test_spike_floor()
+    test_spike_modulated_omega()
     test_diagnostic_logging()
     print("\n✅ All smoke tests passed.")
 

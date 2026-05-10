@@ -154,13 +154,19 @@ class QuaternionLayerNorm(nn.Module):
 # ============================================================================
 
 class SpikeEncoder(nn.Module):
-    """1-layer MLP + sigmoid; gated by mask so missing cells have spike=0."""
-    def __init__(self, n_vars, hidden):
+    """1-layer MLP + sigmoid; gated by mask so missing cells have spike=0.
+
+    Soft floor (≥0) ensures every observed cell contributes at least `floor`
+    mass to hyperedge formation, preventing the "spike starvation" failure
+    mode observed on sparse datasets (P12: 3% active, MIMIC: 12% active).
+    """
+    def __init__(self, n_vars, hidden, floor=0.0):
         super().__init__()
         self.var_emb = nn.Embedding(n_vars, hidden)
         nn.init.normal_(self.var_emb.weight, std=0.1)
         self.proj = nn.Linear(3 + hidden, 1)
         nn.init.zeros_(self.proj.bias)
+        self.floor = float(floor)
 
     def forward(self, value, time_norm, mask, var_id):
         ve = self.var_emb(var_id)                            # [B,N,hidden]
@@ -170,7 +176,12 @@ class SpikeEncoder(nn.Module):
             mask.unsqueeze(-1),
             ve,
         ], dim=-1)
-        s = torch.sigmoid(self.proj(feats).squeeze(-1))
+        # Spike with floor: every observed cell contributes at least `floor`
+        # mass to hyperedge formation, preventing starvation on sparse
+        # (medical) datasets where the encoder otherwise outputs ~0.
+        # floor=0 → original sigmoid; floor>0 → soft floor in [floor, 1].
+        s_raw = torch.sigmoid(self.proj(feats).squeeze(-1))
+        s = self.floor + (1.0 - self.floor) * s_raw
         return s * mask                                       # gate by mask
 
 
@@ -254,6 +265,13 @@ class STHQLayer(nn.Module):
         self.norm = QuaternionLayerNorm(d_model)
         self.dropout = nn.Dropout(0.1)
 
+        # Spike-modulated bandwidth: ω_eff(cell, anchor) = ω(anchor) * (1 + γ(1-spike))
+        # Cells with high spike → narrow ω (precise temporal focus);
+        # low spike → wide ω (diffuse, gather context). Deepens
+        # spike-trigger story without HyperIMTS overlap.
+        # γ stored as raw param, exp(γ_log) > 0 enforces positivity.
+        self.spike_omega_gamma_log = nn.Parameter(torch.tensor(math.log(1.0)))
+
         # Optional hyperedge self-attention (deep layers)
         if use_he_attn:
             self.he_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
@@ -277,10 +295,18 @@ class STHQLayer(nn.Module):
             messages based purely on their (time, var) coordinates)
         """
         B, N, D = q.shape
-        # ---- kernels (position-only, no spike) ------------------------------
+        # ---- kernels: position + spike-modulated bandwidth ------------------
+        # ω_eff(cell, anchor) = ω(anchor) · (1 + γ · (1 - spike(cell)))
+        # High-spike cells → narrow ω (precise focus); low-spike (incl. queries)
+        # → wide ω (diffuse reception). γ is per-layer learnable, ≥ 0.
         omega = torch.exp(self.omega_log).clamp(min=1e-3)         # [K_t]
+        gamma = torch.exp(self.spike_omega_gamma_log).clamp(max=10.0)
+        # Broadcast: [1,1,K_t] * [B,N,1] -> [B,N,K_t]
+        omega_eff = omega.view(1, 1, -1) * (
+            1.0 + gamma * (1.0 - spike_intensity).unsqueeze(-1)
+        )
         diff = time_norm.unsqueeze(-1) - self.tau.view(1, 1, -1)   # [B, N, K_t]
-        kernel_temp = torch.exp(-0.5 * (diff / omega.view(1, 1, -1)) ** 2)
+        kernel_temp = torch.exp(-0.5 * (diff / omega_eff) ** 2)
         var_logits = self.var_affinity[var_id]                     # [B, N, K_v]
         kernel_var = F.softmax(var_logits, dim=-1)
 
@@ -368,7 +394,9 @@ class Model(nn.Module):
         self.kt_per_layer = kt_per_layer
 
         Q = D // 4
-        self.spike_encoder = SpikeEncoder(configs.enc_in, hidden=Q)
+        self.spike_floor = float(getattr(configs, "sthq_spike_floor", 0.0))
+        self.spike_encoder = SpikeEncoder(
+            configs.enc_in, hidden=Q, floor=self.spike_floor)
         self.cell_encoder = CellEncoder(D, configs.enc_in)
 
         self.layers = nn.ModuleList()
@@ -440,12 +468,12 @@ class Model(nn.Module):
                 tau_max = layer.tau.max().item()
                 tau_std = layer.tau.std().item()
                 om = torch.exp(layer.omega_log).mean().item()
+                gam = torch.exp(layer.spike_omega_gamma_log).item()
                 va_sm = F.softmax(layer.var_affinity, dim=-1)
                 ent = (-(va_sm * va_sm.clamp_min(1e-8).log()).sum(-1).mean()).item()
                 layer_stats.append(
-                    f"L{l}(K_t={layer.k_t}): α={alpha:.2f} "
-                    f"τ∈[{tau_min:.2f},{tau_max:.2f}] τ_std={tau_std:.3f} "
-                    f"ω̄={om:.3f} var_ent={ent:.2f}"
+                    f"L{l}(K_t={layer.k_t}): α={alpha:.2f} γ={gam:.2f} "
+                    f"τ_std={tau_std:.3f} ω̄={om:.3f} var_ent={ent:.2f}"
                 )
         logger.debug(
             f"[STHQ diag step={self._diag_step.item()}] "

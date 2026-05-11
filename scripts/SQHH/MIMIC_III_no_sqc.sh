@@ -15,7 +15,7 @@ get_dataset_info "$dataset_name" "$dataset_subset_name"
 model_name="SQHH"
 model_id="SQHH_no_sqc"
 
-# Ablation: no_sqc
+# SQHH ablation: no_sqc
 seq_len=72
 for pred_len in 3; do
     $launch_command main.py \

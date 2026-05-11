@@ -7,23 +7,23 @@ fi
 
 . "$(dirname "$(readlink -f "$0")")/../globals.sh"
 
-dataset_name="USHCN"
+dataset_name="HumanActivity"
 dataset_subset_name=""
 dataset_id=$dataset_name
 get_dataset_info "$dataset_name" "$dataset_subset_name"
 
 model_name="SQHH"
-model_id="SQHH_no_both"
+model_id="SQHH_no_sqc"
 
-# SQHH ablation: no_both
-seq_len=150
-for pred_len in 3; do
+# SQHH ablation: no_sqc
+seq_len=3000
+for pred_len in 300; do
     $launch_command main.py \
     --is_training 1 \
     --collate_fn "collate_fn" \
     --loss "MSE" \
-    --d_model 256 \
-    --n_layers 1 \
+    --d_model 128 \
+    --n_layers 3 \
     --n_heads 1 \
     --use_multi_gpu $use_multi_gpu \
     --dataset_root_path $dataset_root_path \
@@ -41,12 +41,11 @@ for pred_len in 3; do
     --patience 10 \
     --val_interval 1 \
     --itr 1 \
-    --batch_size 16 \
+    --batch_size 32 \
     --learning_rate 1e-3 \
-    --sqhh_k_a 16 \
+    --sqhh_k_a 12 \
     --sqhh_k_e 24 \
-    --sqhh_spike_floor 0.1 \
-    --sqhh_no_sri 1 \
+    --sqhh_spike_floor 0.15 \
     --sqhh_no_sqc 1 \
     --sqhh_diag_interval 200
 done

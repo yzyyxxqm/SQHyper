@@ -206,6 +206,59 @@ class ExpConfigs:
     sqhh_no_sri: int
     sqhh_no_qmf: int
     sqhh_diag_interval: int
+    # EAQ-HG: Event-Anchored Quaternion Hypergraph (Pure topology; no V/L hyperedges)
+    eaqhg_k_e: int
+    eaqhg_k_a: int
+    eaqhg_spike_floor: float
+    eaqhg_dt_aggr: float
+    eaqhg_dt_dist: float
+    eaqhg_no_events: int
+    eaqhg_no_anchors: int
+    eaqhg_no_sqc: int
+    eaqhg_no_quat_fusion: int
+    eaqhg_no_quat_decode: int
+    eaqhg_no_sra: int
+    eaqhg_diag_interval: int
+    # RFH: Receptive-Field Hypergraph (truly orthogonal to HyperIMTS)
+    rfh_k_f: int
+    rfh_k_e: int
+    rfh_k_a: int
+    rfh_bw_t_init: float
+    rfh_bw_x_init: float
+    rfh_dt_aggr: float
+    rfh_dt_dist: float
+    rfh_no_field: int
+    rfh_no_events: int
+    rfh_no_anchors: int
+    rfh_no_value_kernel: int
+    rfh_no_salience: int
+    rfh_diag_interval: int
+    # PSQH: Prototype Spiking Quaternion Hypergraph
+    psqh_n_prototypes: int
+    psqh_tau_spike_init: float
+    psqh_tau_comp_init: float
+    psqh_bw_t_init: float
+    psqh_var_pref: int
+    psqh_no_node_attn: int
+    psqh_no_spike: int
+    psqh_no_quat: int
+    psqh_lambda_div: float
+    psqh_diag_interval: int
+    # SQEH: Spiking Quaternion Event Hypergraph
+    sqeh_n_events: int
+    sqeh_spike_slope: float
+    sqeh_refractory: int
+    sqeh_density_window: float
+    sqeh_no_spike: int
+    sqeh_no_quat_relation: int
+    sqeh_static_field: int
+    sqeh_softmax_route: int
+    sqeh_no_node_attn: int
+    sqeh_no_decoder_ctx: int
+    sqeh_lambda_div: float
+    sqeh_diag_interval: int
+    sqeh_window_size: int
+    sqeh_var_interaction: int
     # ReIMTS
     reimts_pad_time_emb: int
     # ScaleFormer

@@ -63,11 +63,15 @@ class QLinear(nn.Module):
 # QSA - Quaternion Spike Attention
 # =============================================================================
 class QuaternionSpikeAttention(nn.Module):
-    def __init__(self, d_model, spike_slope=5.0, cross_ctx=False, dropout=0.1):
+    def __init__(self, d_model, n_heads=1, spike_slope=5.0, cross_ctx=False, dropout=0.1):
         super().__init__()
         assert d_model % 4 == 0
+        assert d_model % n_heads == 0
         self.d_model = d_model
-        self.Q = d_model // 4
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        assert self.head_dim % 4 == 0, "head_dim must be divisible by 4 for quaternion"
+        self.Q = self.head_dim // 4
         self.spike_slope = spike_slope
         self.cross_ctx = cross_ctx
         self.q_proj = QLinear(d_model, d_model)
@@ -86,31 +90,55 @@ class QuaternionSpikeAttention(nn.Module):
         k = self.k_proj(key)
         if self.cross_ctx and cross_context is not None:
             v = self.v_proj(torch.cat([value, cross_context], dim=-1))
-            # 也让 cross_context 影响 key（通过加法融合，不增加参数）
             k = k + self.k_proj(cross_context)
         else:
             v = self.v_proj(value)
-        qr, qi, qj, qk_c = qsplit(q)
-        kr, ki, kj, kk_c = qsplit(k)
+
+        H = self.n_heads
+        hd = self.head_dim
+        Q = self.Q
+
+        # 多头：split 沿最后一维，concat 沿 batch 维（与 HyperIMTS 相同策略）
+        # [B, M, D] -> H x [B, M, hd] -> cat -> [B*H, M, hd]
+        q_h = torch.cat(q.split(hd, dim=-1), dim=0)  # [B*H, M, hd]
+        k_h = torch.cat(k.split(hd, dim=-1), dim=0)  # [B*H, N, hd]
+        v_h = torch.cat(v.split(hd, dim=-1), dim=0)  # [B*H, N, hd]
+
+        # 四元数点积（每头独立）
+        qr, qi, qj, qk_c = qsplit(q_h)
+        kr, ki, kj, kk_c = qsplit(k_h)
         scores = (torch.einsum("bmd,bnd->bmn", qr, kr)
                  + torch.einsum("bmd,bnd->bmn", qi, ki)
                  + torch.einsum("bmd,bnd->bmn", qj, kj)
-                 + torch.einsum("bmd,bnd->bmn", qk_c, kk_c)) / math.sqrt(self.Q)
+                 + torch.einsum("bmd,bnd->bmn", qk_c, kk_c)) / math.sqrt(Q)
         scores = scores.clamp(-6, 6)
-        # 密度自适应脉冲阈值：每个 key 节点根据其局部密度有不同的阈值
-        # 密集区域 → 高阈值（更选择性），稀疏区域 → 低阈值（更包容）
+
+        # 密度自适应脉冲阈值
         base_threshold = F.softplus(self.threshold)
         if density_feat is not None:
             d_shift = self.density_mod(density_feat).squeeze(-1)  # [B, N]
-            threshold = base_threshold + d_shift.unsqueeze(1) * 0.1  # [B, 1, N]
+            # repeat H 次对齐 batch 维
+            d_shift_h = d_shift.repeat(H, 1)  # [B*H, N]
+            threshold = base_threshold + d_shift_h.unsqueeze(1) * 0.1
         else:
             threshold = base_threshold
+
         spike_gate = torch.sigmoid(self.spike_slope * (scores - threshold))
         modulated_scores = scores * (1.0 + spike_gate * 2.0)
-        modulated_scores = modulated_scores.masked_fill(mask == 0, -1e4)
+
+        # mask repeat H 次
+        mask_h = mask.repeat(H, 1, 1) if mask.dim() == 3 else mask.repeat(H, 1)
+        if mask_h.dim() == 2:
+            mask_h = mask_h.unsqueeze(1) * mask_h.unsqueeze(2)
+        modulated_scores = modulated_scores.masked_fill(mask_h == 0, -1e4)
         weights = torch.softmax(modulated_scores.clamp(-30, 30), dim=-1)
         weights = self.attn_dropout(weights)
-        return self.out_proj(torch.bmm(weights, v))
+        out_h = torch.bmm(weights, v_h)  # [B*H, M, hd]
+
+        # 合并多头：[B*H, M, hd] -> H x [B, M, hd] -> cat -> [B, M, D]
+        B = query.shape[0]
+        out = torch.cat(out_h.split(B, dim=0), dim=-1)  # [B, M, D]
+        return self.out_proj(out)
 
 # =============================================================================
 # Encoder
@@ -338,13 +366,14 @@ class VariableInteraction(nn.Module):
 # QSMP Block
 # =============================================================================
 class QSMPBlock(nn.Module):
-    def __init__(self, d_model, n_events, n_vars: int = 1, spike_slope=5.0, dropout=0.0,
-                 no_spike=False, window_size=5, use_var_interaction: bool = True):
+    def __init__(self, d_model, n_events, n_vars: int = 1, n_heads: int = 1,
+                 spike_slope=5.0, dropout=0.0, no_spike=False, window_size=5,
+                 use_var_interaction: bool = True):
         super().__init__()
         self.d_model = d_model
         self.use_var_interaction = use_var_interaction
-        self.qsa_t = QuaternionSpikeAttention(d_model, spike_slope=spike_slope, cross_ctx=True, dropout=0.05)
-        self.qsa_v = QuaternionSpikeAttention(d_model, spike_slope=spike_slope, cross_ctx=True, dropout=0.05)
+        self.qsa_t = QuaternionSpikeAttention(d_model, n_heads=n_heads, spike_slope=spike_slope, cross_ctx=True, dropout=0.05)
+        self.qsa_v = QuaternionSpikeAttention(d_model, n_heads=n_heads, spike_slope=spike_slope, cross_ctx=True, dropout=0.05)
         self.he_norm_t = nn.LayerNorm(d_model)
         self.he_norm_v = nn.LayerNorm(d_model)
         self.event_conv = TemporalEventConvolution(d_model, n_events, window_size)
@@ -458,7 +487,7 @@ class Model(nn.Module):
         self.variable_he_w = nn.Parameter(torch.randn(self.enc_in, self.d_model) * 0.1)
         self.n_events = n_events
         self.blocks = nn.ModuleList([
-            QSMPBlock(self.d_model, n_events, self.enc_in, spike_slope, dropout, no_spike, window_size, use_var_interaction)
+            QSMPBlock(self.d_model, n_events, self.enc_in, configs.n_heads, spike_slope, dropout, no_spike, window_size, use_var_interaction)
             for _ in range(self.n_layers)
         ])
 
